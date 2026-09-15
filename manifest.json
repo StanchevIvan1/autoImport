@@ -1,0 +1,72 @@
+{
+  "manifest_version": 3,
+  "name": "AutoImport BG \u2013 Auction to Mobile.bg",
+  "version": "2.0.0",
+  "description": "\u041f\u0440\u0435\u0445\u0432\u044a\u0440\u043b\u044f \u043e\u0431\u044f\u0432\u0438 \u043e\u0442 Copart/IAAI \u0434\u0438\u0440\u0435\u043a\u0442\u043d\u043e \u0432 mobile.bg",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.copart.com/*",
+    "https://*.iaai.com/*",
+    "https://*.copart.co.uk/*",
+    "https://cs.copart.com/*",
+    "https://vis.iaai.com/*",
+    "https://anvis.iaai.com/*",
+    "https://mobile.bg/*",
+    "https://www.mobile.bg/*"
+  ],
+  "background": {
+    "service_worker": "background/worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.copart.com/lot/*"
+      ],
+      "js": [
+        "content_scripts/copart_scraper.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://*.iaai.com/VehicleDetail/*",
+        "https://*.iaai.com/vehicles/*",
+        "https://*.iaai.com/vehicle/*",
+        "https://*.iaai.com/Search*",
+        "https://*.iaai.com/buy/*"
+      ],
+      "js": [
+        "content_scripts/iaai_scraper.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://mobile.bg/*",
+        "https://www.mobile.bg/*"
+      ],
+      "js": [
+        "content_scripts/mobile_filler.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
