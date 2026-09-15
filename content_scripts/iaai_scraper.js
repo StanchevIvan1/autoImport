@@ -6,9 +6,18 @@
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  function milesToKm(v) {
-    const n = parseInt(String(v).replace(/[^0-9]/g, ''));
-    return isNaN(n) ? 0 : Math.round(n * 1.60934);
+  function milesToKm(value, unit = '') {
+    const raw = String(value).trim();
+    // Unknown/not-actual readings are not a verified distance. Preserve zero.
+    if (/unknown|not actual|exempt|inoperable|not available/i.test(raw)) return null;
+    const match = raw.match(/^([0-9][0-9, ]*)(?:\s*(mi(?:les)?|km|kilomet(?:er|re)s?))?(?:\s|$)/i);
+    if (!match) return null;
+    const number = Number(match[1].replace(/[, ]/g, ''));
+    const units = (match[2] || unit).toLowerCase().trim();
+    if (!Number.isFinite(number)) return null;
+    if (/^(km|kilomet(?:er|re)s?)$/.test(units)) return number;
+    if (/^(mi|miles?)$/.test(units)) return Math.round(number * 1.60934);
+    return null;
   }
 
   // ── Метод 1: Потвърдени реални hidden input id-та от диагностика ──
@@ -84,7 +93,7 @@
     const t = document.body.innerText;
     const g = re => t.match(re)?.[1]?.trim() || '';
     return {
-      odometer:        g(/Odometer[:\s]*\n?([0-9,]+\s*mi[^\n]*)/i),
+      odometer:        g(/Odometer[:\s]*\n?([0-9,]+\s*(?:mi|km)[^\n]*)/i),
       primaryDamage:   g(/Primary\s*Damage[:\s]*\n?([^\n]+)/i),
       secondaryDamage: g(/Secondary\s*Damage[:\s]*\n?([^\n]+)/i),
       engine:          g(/Engine[:\s]*\n?([0-9.]+L[^\n]+)/i),
@@ -220,12 +229,13 @@
     const horsepower = engineStr.match(/(\d+)\s*(?:hp|HP)/)?.[1] || '';
 
     // ── Гориво ──
-    const fuelSrc = desc['fuel'] || desc['fuel type'] || engineStr || '';
+    const fuelSrc = desc['fuel'] || desc['fuel type'] || text.fuel || engineStr || '';
     const fuelRaw = fuelSrc.toLowerCase();
-    const fuel = fuelRaw.includes('diesel') ? 'Дизел'
+    const fuel = fuelRaw.includes('hybrid') ? 'Хибриден'
+               : fuelRaw.includes('diesel') ? 'Дизел'
                : fuelRaw.includes('electric') ? 'Електрически'
-               : fuelRaw.includes('hybrid') ? 'Хибриден'
-               : fuelRaw.includes('gas') || fuelRaw.includes('flex') || engineStr ? 'Бензин' : '';
+               : /gas|petrol|flex/.test(fuelRaw) ? 'Бензин' : '';
+
 
     // ── Трансмисия ──
     const transRaw = (desc['transmission'] || text.transmission || '').toLowerCase();
@@ -281,7 +291,8 @@
       source: 'iaai',
       lotNumber: stockNum, stockNumber: stockNum, lotUrl, title,
       year, make, model, vin,
-      odometerMiles: parseInt(String(odomRaw).replace(/[^0-9]/g, '')) || 0,
+      odometerRaw: odomRaw,
+      odometerMiles: /\bmi(?:les)?\b/i.test(String(odomRaw)) ? Number(String(odomRaw).match(/[0-9,]+/)?.[0].replace(/,/g, '')) : null,
       odometerKm: odomKm,
       engine: engineStr, displacement, fuel, horsepower,
       transmission, drive, bodyType,
@@ -297,10 +308,13 @@
 
   chrome.runtime.onMessage.addListener((msg, _, sendResponse) => {
     if (msg.action === 'SCRAPE_NOW') {
-      scrape()
-        .then(data => chrome.runtime.sendMessage({ action: 'SAVE_CAR_DATA', data },
-          () => sendResponse({ success: true, data })))
-        .catch(err => sendResponse({ success: false, error: err.message }));
+      const startUrl = location.href;
+      scrape().then(async data => {
+        if (location.href !== startUrl) throw Error('Обявата е сменена по време на извличането.');
+        const saved = await chrome.runtime.sendMessage({ action: 'SAVE_CAR_DATA', requestId: msg.requestId, data });
+        if (!saved?.success) throw Error(saved?.error || 'Данните не са запазени.');
+        sendResponse({ success: true, data: saved.data });
+      }).catch(err => sendResponse({ success: false, error: err.message }));
       return true;
     }
     if (msg.action === 'PING') sendResponse({ active: true, source: 'iaai', ready: true });

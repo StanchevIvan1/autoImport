@@ -1,6 +1,10 @@
 // popup.js v3.0 – с auth/лицензна система
 document.addEventListener('DOMContentLoaded', async () => {
 
+  let displayedCaptureId = null;
+  let refreshData = null;
+  let fillBusy = false;
+
   // ── Tabs ──
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
@@ -38,6 +42,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (us.email)        document.getElementById('mb-username').value = us.email;
   if (us.descTemplate) { const dt = document.getElementById('s-desc-template'); if (dt) dt.value = us.descTemplate; }
 
+  async function refreshCities() {
+    const region = (document.getElementById('s-region').value || 'София').toLowerCase().replace(/^(?:обл\.?|област)\s*/, '').trim();
+    const key = 'mobileCities:' + region;
+    const saved = await chrome.storage.local.get(key);
+    document.getElementById('s-city-options').innerHTML = (saved[key] || []).map(city => `<option value="${escapeHtml(city.label)}"></option>`).join('');
+  }
+  document.getElementById('s-region').addEventListener('change', () => refreshCities().catch(console.error));
+  chrome.storage.onChanged.addListener(changes => {
+    if (Object.keys(changes).some(key => key.startsWith('mobileCities:'))) refreshCities().catch(console.error);
+  });
+  await refreshCities();
+
   // ── Main tab логика ──
   async function initMainTab() {
     document.getElementById('auth-wall')?.classList.add('hidden');
@@ -45,14 +61,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const url = activeTab?.url || '';
-    const isCopart  = url.includes('copart.com/lot/');
-    const isIAAI    = url.includes('iaai.com/VehicleDetail/') || url.includes('iaai.com/vehicles/');
-    const isMobile  = url.includes('mobile.bg');
+    const page = new URL(url || 'https://invalid.local');
+    const isCopart = page.protocol === 'https:' && /(^|\.)copart\.com$/.test(page.hostname) && /^\/lot\/\d+/i.test(page.pathname);
+    const isIAAI = page.protocol === 'https:' && /(^|\.)iaai\.com$/.test(page.hostname) && /^\/(VehicleDetail|vehicles|vehicle|buy)\/.+/i.test(page.pathname);
+    const isMobile = page.protocol === 'https:' && ['mobile.bg', 'www.mobile.bg'].includes(page.hostname);
     const isAuction = isCopart || isIAAI;
 
     // Винаги чети свежи данни – store може да е остарял ако функцията се вика повторно
-    const freshStore = await chrome.storage.local.get('carData');
-    const carData = freshStore.carData || null;
+    const readData = () => request({ action: 'GET_CAR_DATA', ...(isAuction ? { sourceTabId: activeTab.id } : {}) });
+    let carData = (await readData()).data || null;
 
     dot('page',
       isAuction ? 'green' : isMobile ? 'yellow' : '',
@@ -62,11 +79,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     :             'Отвори Copart или IAAI обява');
 
     if (carData) {
-      const km = carData.odometerKm ? ` · ${carData.odometerKm.toLocaleString()} км` : '';
+      const km = carData.odometerKm != null ? ` · ${carData.odometerKm.toLocaleString()} км` : '';
       dot('data', 'green', `✓ ${carData.year} ${carData.make} ${carData.model}${km}`);
       renderData(carData);
     } else {
-      dot('data', '', 'Няма запазени данни');
+      resetPreview();
     }
 
     const authNow = await checkAuth();
@@ -76,17 +93,25 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const btnScrape = document.getElementById('btn-scrape');
     const btnFill   = document.getElementById('btn-fill');
+    btnScrape.disabled = !isAuction;
+    btnFill.disabled = !carData;
     if (isAuction) {
       btnScrape.disabled = false;
       btnScrape.textContent = `📥 Извлечи от ${isCopart ? 'Copart' : 'IAAI'}`;
     }
-    if (carData) btnFill.disabled = false;
+    refreshData = async () => {
+      carData = (await readData()).data || null;
+      if (carData) renderData(carData); else resetPreview();
+      btnFill.disabled = fillBusy || !carData;
+    };
 
     // ── Извличане ──
-    btnScrape.addEventListener('click', async () => {
+    btnScrape.onclick = async () => {
       btnScrape.disabled = true;
       btnScrape.innerHTML = '<span class="spinner"></span> Изчакай...';
       try {
+        const ticket = await request({ action: 'BEGIN_SCRAPE', tabId: activeTab.id });
+        carData = null; resetPreview(); btnFill.disabled = true;
         const file = isCopart ? 'content_scripts/copart_scraper.js' : 'content_scripts/iaai_scraper.js';
         let alive = false;
         try { alive = !!(await chrome.tabs.sendMessage(activeTab.id, { action: 'PING' }))?.active; } catch(_) {}
@@ -94,9 +119,10 @@ document.addEventListener('DOMContentLoaded', async () => {
           await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: [file] });
           await pause(800);
         }
-        const r = await chrome.tabs.sendMessage(activeTab.id, { action: 'SCRAPE_NOW' });
+        const r = await chrome.tabs.sendMessage(activeTab.id, { action: 'SCRAPE_NOW', requestId: ticket.requestId });
         if (r?.success && r.data) {
-          const d = r.data, km = d.odometerKm ? ` · ${d.odometerKm.toLocaleString()} км` : '';
+          carData = r.data;
+          const d = carData, km = d.odometerKm != null ? ` · ${d.odometerKm.toLocaleString()} км` : '';
           dot('data', 'green', `✓ ${d.year} ${d.make} ${d.model}${km}`);
           btnFill.disabled = false;
           renderData(d);
@@ -104,85 +130,50 @@ document.addEventListener('DOMContentLoaded', async () => {
           btnScrape.textContent = '✅ Извлечено!';
           setTimeout(() => document.querySelector('[data-tab="data"]')?.click(), 600);
         } else {
+          dot('data', 'yellow', r?.error || 'Неуспешно извличане.');
           btnScrape.style.background = '';
           btnScrape.textContent = '❌ Неуспешно – презареди';
           btnScrape.disabled = false;
         }
       } catch(e) {
+        dot('data', 'yellow', e.message);
         btnScrape.textContent = '❌ Презареди страницата';
         btnScrape.disabled = false;
       }
-    });
+    };
 
     // ── Попълни ──
-    const MOBILE_FORM_URL = 'https://www.mobile.bg/pcgi/mobile.cgi?pubtype=1&act=1';
-
-    btnFill.addEventListener('click', async () => {
-      const auth = await checkAuth();
-      if (!auth.ok) { document.querySelector('[data-tab="account"]')?.click(); return; }
-      if (!carData) return;
-
+    btnFill.onclick = async () => {
+      if (fillBusy) return;
+      fillBusy = true;
       btnFill.disabled = true;
-      btnFill.innerHTML = '<span class="spinner"></span> Отварям mobile.bg...';
-      const settings = await getSettings();
-
+      const expectedId = displayedCaptureId;
       try {
-        // Случай 1: вече сме на формата за добавяне на обява – попълни директно
-        if (isMobile && url.includes('pubtype=1')) {
-          await injectAndFill(activeTab.id, carData, settings);
-          btnFill.innerHTML = '✅ Попълнено!';
-          setTimeout(() => window.close(), 800);
-          return;
+        const auth = await checkAuth();
+        if (!auth.ok) { document.querySelector('[data-tab="account"]')?.click(); return; }
+        const fresh = (await readData()).data;
+        if (!fresh || fresh.capture.id !== expectedId) {
+          await refreshData();
+          throw Error('Данните са сменени. Провери показаната обява и опитай отново.');
         }
-
-        // Случай 2: вече има отворен таб с формата за добавяне
-        const formTabs = await chrome.tabs.query({ url: '*://*.mobile.bg/pcgi/mobile.cgi*' });
-        const formTab  = formTabs.find(t => t.url.includes('pubtype=1'));
-        if (formTab) {
-          await chrome.tabs.update(formTab.id, { active: true });
-          await chrome.windows.update(formTab.windowId, { focused: true });
-          await pause(400);
-          // Провери дали autoResume вече е в ход (има sessionStorage pending)
-          const hasResume = await chrome.scripting.executeScript({
-            target: { tabId: formTab.id },
-            func: () => !!sessionStorage.getItem('__ai_phase2_pending'),
-          });
-          const resumePending = hasResume?.[0]?.result;
-          if (!resumePending) {
-            await injectAndFill(formTab.id, carData, settings);
-          }
-          btnFill.innerHTML = '✅ Попълването е стартирано!';
-          setTimeout(() => window.close(), 800);
-          return;
-        }
-
-        // Случай 3: отвори формата директно и изчакай да се зареди
-        btnFill.innerHTML = '<span class="spinner"></span> Зареждам формата...';
-        const newTab = await chrome.tabs.create({ url: MOBILE_FORM_URL, active: true });
-        await chrome.windows.update(newTab.windowId, { focused: true });
-
-        // Делегирай изпращането на START_FILL на background worker-а –
-        // той живее независимо от popup-а и не спира когато popup-ът се затвори.
-        chrome.runtime.sendMessage({
-          action: 'FILL_WHEN_READY',
-          tabId: newTab.id,
-          data: carData,
-          settings,
-        });
-
-        btnFill.innerHTML = '✅ Попълването ще започне автоматично!';
+        const settings = await getSettings();
+        const result = await request({ action: 'START_TRANSFER', captureId: expectedId, settings,
+          ...(isMobile && page.pathname === '/pcgi/mobile.cgi' && page.searchParams.get('pubtype') === '1' ? { tabId: activeTab.id } : {}) });
+        if (result.transfer.phase === 'failed') throw Error(result.transfer.error);
+        btnFill.textContent = result.duplicate ? 'ℹ️ Това прехвърляне вече е започнато' : '✅ Попълването е стартирано';
         setTimeout(() => window.close(), 600);
-
-      } catch(e) {
-        console.error('[Popup] btnFill грешка:', e);
-        btnFill.disabled = false;
+      } catch (e) {
+        dot('data', 'yellow', e.message);
         btnFill.textContent = '❌ Грешка – опитай пак';
+      } finally {
+        fillBusy = false;
+        btnFill.disabled = !carData;
       }
-    });
+    };
 
-    document.getElementById('btn-open-mobile').addEventListener('click', () => {
+    document.getElementById('btn-open-mobile').onclick = () => {
       chrome.tabs.create({ url: 'https://www.mobile.bg' }); window.close();
-    });
+    };
   }
 
   // ── Auth функции ──
@@ -306,18 +297,33 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // ── Изчисти ──
   const doClear = async () => {
-    await chrome.storage.local.remove('carData');
-    dot('data', '', 'Няма запазени данни');
+    try {
+      await request({ action: 'CLEAR_CAR_DATA' });
+      resetPreview();
+      await refreshData?.();
+    } catch (e) { dot('data', 'yellow', e.message); }
+  };
+  document.getElementById('btn-clear-data')?.addEventListener('click', doClear);
+  document.getElementById('footer-clear')?.addEventListener('click', doClear);
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.importState) refreshData?.().catch(e => dot('data', 'yellow', e.message));
+  });
+
+  function resetPreview() {
+    displayedCaptureId = null;
+    dot('data', '', 'Няма запазени данни за тази обява');
     document.getElementById('btn-fill').disabled = true;
     document.getElementById('no-data-msg')?.classList.remove('hidden');
     document.getElementById('data-preview')?.classList.add('hidden');
-  };
-  document.getElementById('btn-clear-data')?.addEventListener('click', doClear);
-  document.getElementById('footer-clear')?.addEventListener('click', async () => {
-    await chrome.storage.local.remove(['carData']);
-    doClear();
-  });
-
+    document.getElementById('images-row').innerHTML = '';
+    document.getElementById('d-horsepower').value = '';
+    document.getElementById('d-modification').value = '';
+  }
+  async function request(message) {
+    const response = await chrome.runtime.sendMessage(message);
+    if (!response?.success) throw Error(response?.error || 'Няма отговор от разширението.');
+    return response;
+  }
   // ── Helpers ──
   async function getSettings() {
     const r = await chrome.storage.local.get('userSettings');
@@ -325,36 +331,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Добави per-обява корекции от Data таба (имат приоритет над scraper данните)
     return {
       ...base,
-      horsepower:   document.getElementById('d-horsepower')?.value.trim() || base.horsepower || '',
-      modification: document.getElementById('d-modification')?.value.trim() || base.modification || '',
+      horsepower:   document.getElementById('d-horsepower')?.value.trim() || '',
+      modification: document.getElementById('d-modification')?.value.trim() || '',
     };
-  }
-
-  async function injectAndFill(tabId, data, settings) {
-    // Инжектирай скрипта (идемпотентно — ако вече е зареден, __ai_listener_registered го защитава)
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ['content_scripts/mobile_filler.js']
-      });
-    } catch(e) { /* вероятно вече е инжектиран */ }
-
-    // Изчакай listener-ът да се регистрира чрез PING polling (до 5 сек)
-    let ready = false;
-    for (let i = 0; i < 20; i++) {
-      await pause(250);
-      try {
-        const pong = await chrome.tabs.sendMessage(tabId, { action: 'PING' });
-        if (pong?.active) { ready = true; break; }
-      } catch(_) { /* още не е готов */ }
-    }
-
-    if (!ready) {
-      // Последен опит без потвърждение
-      await pause(500);
-    }
-
-    await chrome.tabs.sendMessage(tabId, { action: 'START_FILL', data, settings });
   }
 
   function dot(id, cls, text) {
@@ -367,7 +346,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     const b = document.getElementById(id); if (!b) return;
     b.textContent = tmp; setTimeout(() => b.textContent = orig, 2000);
   }
+  function escapeHtml(value) { return String(value).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c])); }
   function renderData(d) {
+    if (displayedCaptureId !== d.capture?.id) {
+      document.getElementById('d-horsepower').value = d.horsepower || '';
+      document.getElementById('d-modification').value = d.series || '';
+    }
+    displayedCaptureId = d.capture?.id || null;
     document.getElementById('no-data-msg')?.classList.add('hidden');
     document.getElementById('data-preview')?.classList.remove('hidden');
     const badge = document.getElementById('source-badge');
@@ -375,11 +360,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const titleEl = document.getElementById('car-title');
     if (titleEl) titleEl.textContent = d.title || `${d.year} ${d.make} ${d.model}`.trim() || '–';
     const ir = document.getElementById('images-row');
-    if (ir && d.images?.length) ir.innerHTML = d.images.slice(0, 6).map(u =>
-      `<img src="${u}" class="img-thumb" onerror="this.style.display='none'">`).join('');
+    if (ir) ir.innerHTML = (d.images || []).map(u =>
+      `<a href="${escapeHtml(u)}" target="_blank" rel="noopener noreferrer"><img src="${escapeHtml(u)}" class="img-thumb"></a>`).join('');
     const sp = document.getElementById('car-specs');
     if (sp) sp.innerHTML = [
-      ['Пробег',    d.odometerKm ? `${d.odometerKm.toLocaleString()} км` : '–'],
+      ['Пробег',    d.odometerKm != null ? `${d.odometerKm.toLocaleString()} км` : '–'],
       ['Двигател',  d.displacement ? `${d.displacement} сс` : d.engine || '–'],
       ['Гориво',    d.fuel || '–'],
       ['Трансмис.', d.transmission || '–'],
@@ -389,13 +374,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       ['Снимки',    `${d.images?.length || 0} бр.`],
       ['Щета',      d.primaryDamage || '–'],
       ['Цвят',      d.color || '–'],
-    ].map(([l, v]) => `<div class="spec-item"><div class="spec-label">${l}</div><div class="spec-value">${v}</div></div>`).join('');
+    ].map(([l, v]) => `<div class="spec-item"><div class="spec-label">${l}</div><div class="spec-value">${escapeHtml(v)}</div></div>`).join('');
 
-    // Попълни корекционните полета с извлечените стойности като начална точка
-    // (потребителят може да ги редактира преди попълване)
-    const hpEl  = document.getElementById('d-horsepower');
-    const modEl = document.getElementById('d-modification');
-    if (hpEl  && !hpEl.value  && d.horsepower)  hpEl.value  = d.horsepower;
-    if (modEl && !modEl.value && d.series)       modEl.value = d.series;
   }
 });

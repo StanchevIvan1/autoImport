@@ -151,6 +151,7 @@
       <div class="source-badge" id="source-badge">📡</div>
       <div class="car-title"  id="car-title">–</div>
       <div class="images-row" id="images-row"></div>
+      <div class="alert alert-warning">Провери данните преди публикуване. Прилага се оригиналният пресет за екстри и цена с ДДС. При липсващ месец се избира случаен. 4x4 е според задвижването. Снимките се прехвърлят автоматично към тази обява.</div>
       <div class="car-specs"  id="car-specs"></div>
 
       <!-- Ръчни корекции за конкретната обява -->
@@ -184,7 +185,7 @@
         </div>
         <div class="input-group">
           <label class="input-label">Населено място</label>
-          <input type="text" class="input-field" id="s-city" placeholder="София">
+          <input type="text" class="input-field" id="s-city" list="s-city-options" placeholder="София"><datalist id="s-city-options"></datalist>
         </div>
       </div>
       <div class="input-group">
@@ -213,7 +214,7 @@
           <option value="Силистра">обл. Силистра</option>
           <option value="Сливен">обл. Сливен</option>
           <option value="Смолян">обл. Смолян</option>
-          <option value="Стара Zagora">обл. Стара Загора</option>
+          <option value="Стара Загора">обл. Стара Загора</option>
           <option value="Търговище">обл. Търговище</option>
           <option value="Хасково">обл. Хасково</option>
           <option value="Шумен">обл. Шумен</option>
@@ -299,7 +300,7 @@
 
 <div class="footer">
   <span class="version">v2.1 – AutoImport BG</span>
-  <button class="clear-link" id="footer-clear">Изчисти всичко</button>
+  <button class="clear-link" id="footer-clear">Изчисти обяви и прехвърляния</button>
 </div>
 
 <script src="popup.js"></script>

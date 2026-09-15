@@ -6,9 +6,18 @@
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  function milesToKm(val) {
-    const n = parseInt(String(val).replace(/[^0-9]/g, ''));
-    return isNaN(n) ? 0 : Math.round(n * 1.60934);
+  function milesToKm(value, unit = '') {
+    const raw = String(value).trim();
+    // Unknown/not-actual readings are not a verified distance. Preserve zero.
+    if (/unknown|not actual|exempt|inoperable|not available/i.test(raw)) return null;
+    const match = raw.match(/^([0-9][0-9, ]*)(?:\s*(mi(?:les)?|km|kilomet(?:er|re)s?))?(?:\s|$)/i);
+    if (!match) return null;
+    const number = Number(match[1].replace(/[, ]/g, ''));
+    const units = (match[2] || unit).toLowerCase().trim();
+    if (!Number.isFinite(number)) return null;
+    if (/^(km|kilomet(?:er|re)s?)$/.test(units)) return number;
+    if (/^(mi|miles?)$/.test(units)) return Math.round(number * 1.60934);
+    return null;
   }
 
   // ── От __NEXT_DATA__ (Next.js JSON) ──
@@ -19,7 +28,9 @@
       const root = JSON.parse(el.textContent);
       function search(obj, depth) {
         if (!obj || typeof obj !== 'object' || depth > 12) return null;
-        if (obj.lotNumberStr || obj.ln || (obj.mkn && obj.mdn)) return obj;
+        const expected = location.pathname?.match(/\/lot\/(\d+)/i)?.[1] || location.href.match(/\/lot\/(\d+)/i)?.[1];
+        const number = String(obj.lotNumberStr || obj.ln || '');
+        if (number && number === expected) return obj;
         for (const v of Object.values(obj)) { const r = search(v, depth+1); if (r) return r; }
         return null;
       }
@@ -60,7 +71,7 @@
     const t = document.body.innerText;
     const g = re => t.match(re)?.[1]?.trim() || '';
     return {
-      odometer:        g(/Odometer[:\s]+([0-9,]+\s*mi[^\n]*)/i),
+      odometer:        g(/Odometer[:\s]+([0-9,]+\s*(?:mi|km)[^\n]*)/i),
       primaryDamage:   g(/Primary\s*Damage[:\s]+([^\n]+)/i),
       secondaryDamage: g(/Secondary\s*Damage[:\s]+([^\n]+)/i),
       engineType:      g(/Engine\s*[Tt]ype[:\s]+([^\n]+)/i),
@@ -77,7 +88,7 @@
       saleDate:        g(/Sale\s*[Dd]ate[:\s]+([^\n]+)/i),
       productionMonth: g(/(?:Mfg\s*Date|Date\s*of\s*Mfg|Month\s*of\s*Mfg)[:\s]+([^\n]+)/i),
       // Конски сили – Copart рядко показва, но проверяваме
-      horsepower:      g(/(?:Horse\s*Power|HP|Horsepower|Engine\s*Power)[:\s]+([0-9]+)\s*(?:hp|kw|к\.с\.)?/i),
+      horsepower:      g(/(?:Horse\s*Power|HP|Horsepower)[:\s]+([0-9]+(?:\s*(?:hp|kw|к\.с\.))?)/i),
       // Допълнителни
       netWeight:       g(/Net\s*Weight[:\s]+([^\n]+)/i),
       vehicleType:     g(/Vehicle\s*Type[:\s]+([^\n]+)/i),
@@ -125,8 +136,8 @@
   function parse(nd, pairs, text) {
     function g(...keys) {
       for (const k of keys) {
-        const v = nd?.[k] || pairs[k.toLowerCase()] || text[k];
-        if (v && String(v).trim()) return String(v).trim();
+        const v = [nd?.[k], pairs[k.toLowerCase()], text[k]].find(value => value != null && String(value).trim() !== '');
+        if (v != null) return String(v).trim();
       }
       return '';
     }
@@ -172,7 +183,12 @@
 
     // Одометър
     const odomRaw = g('od','odometer','mileage') || text.odometer || '';
-    const odomKm = milesToKm(odomRaw);
+    let odomKm = milesToKm(odomRaw, g('odometerUnit','odometerUnits','odometerUom'));
+    const visibleOdometer = pairs['odometer'] || text.odometer || '';
+    if (odomKm == null && /^[0-9, ]+$/.test(odomRaw) &&
+        Number(odomRaw.replace(/[, ]/g, '')) === Number(visibleOdometer.match(/^[0-9, ]+/)?.[0].replace(/[, ]/g, ''))) {
+      odomKm = milesToKm(visibleOdometer);
+    }
 
     // Двигател
     const engineStr = g('egn','engineType','engine type','engine') || text.engineType || '';
@@ -181,19 +197,20 @@
     if (litM) displacement = String(Math.round(parseFloat(litM[1])*1000));
 
     // Конски сили – от Next.js или текст
-    // Copart го пази като 'hp' или 'engine_power' в JSON
-    let horsepower = g('hp','engine_power','horsepower','power') || text.horsepower || '';
+    // Accept explicitly named horsepower fields; generic power may be in kW.
+    const hpRaw = g('hp','horsepower') || text.horsepower || '';
+    const horsepower = /^\d+(?:\s*(?:hp|к\.с\.))?$/i.test(hpRaw) ? hpRaw.match(/^\d+/)[0] : '';
     // Опитай да извлечем от engine string: "5.5L V8 SFI" → VIN decode би дал кс
     // Ако нямаме – ще оставим празно
 
     // Гориво
     const fuelRaw = (g('ft','fuel','fuelType') || text.fuel || '').toLowerCase();
-    const fuel = fuelRaw.includes('gas')||fuelRaw.includes('petrol') ? 'Бензин'
+    const fuel = fuelRaw.includes('hybrid') ? 'Хибриден'
                : fuelRaw.includes('diesel') ? 'Дизел'
                : fuelRaw.includes('electric') ? 'Електрически'
-               : fuelRaw.includes('hybrid') ? 'Хибриден'
-               : engineStr.toLowerCase().includes('diesel') ? 'Дизел'
-               : 'Бензин';
+               : /gas|petrol|flex/.test(fuelRaw) ? 'Бензин'
+               : '';
+
 
     // Трансмисия
     const transRaw = (g('tsmn','transmission') || text.transmission || '').toLowerCase();
@@ -261,7 +278,8 @@
     return {
       source:'copart', lotNumber, lotUrl, title,
       year, make, model, vin,
-      odometerMiles: parseInt(String(odomRaw).replace(/[^0-9]/g,''))||0,
+      odometerRaw: odomRaw,
+      odometerMiles: /\bmi(?:les)?\b/i.test(String(odomRaw)) ? Number(String(odomRaw).match(/[0-9,]+/)?.[0].replace(/,/g, '')) : null,
       odometerKm: odomKm,
       engine:engineStr, displacement, fuel, horsepower,
       transmission, drive, bodyType,
@@ -290,12 +308,18 @@
     return data;
   }
 
-  chrome.runtime.onMessage.addListener((msg,_,sendResponse)=>{
-    if(msg.action==='SCRAPE_NOW'){
-      scrape().then(data=>chrome.runtime.sendMessage({action:'SAVE_CAR_DATA',data},()=>sendResponse({success:true,data}))).catch(err=>sendResponse({success:false,error:err.message}));
+  chrome.runtime.onMessage.addListener((msg, _, sendResponse) => {
+    if (msg.action === 'SCRAPE_NOW') {
+      const startUrl = location.href;
+      scrape().then(async data => {
+        if (location.href !== startUrl) throw Error('Обявата е сменена по време на извличането.');
+        const saved = await chrome.runtime.sendMessage({ action: 'SAVE_CAR_DATA', requestId: msg.requestId, data });
+        if (!saved?.success) throw Error(saved?.error || 'Данните не са запазени.');
+        sendResponse({ success: true, data: saved.data });
+      }).catch(err => sendResponse({ success: false, error: err.message }));
       return true;
     }
-    if(msg.action==='PING'){sendResponse({active:true,source:'copart',ready:true});}
+    if (msg.action === 'PING') sendResponse({ active: true, source: 'copart', ready: true });
   });
 
   console.log('[AutoImport] copart_scraper v4.0 зареден');

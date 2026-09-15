@@ -1,14 +1,43 @@
 // mobile_filler.js v12 – двуфазно попълване: mobile.bg прави form submit/reload
 // при смяна на региона (document.pub.submit()), затова разделяме на две фази
-// и преживяваме презареждането чрез sessionStorage.
+// и продължаваме чрез запис за конкретния таб в background worker.
 (function () {
   'use strict';
 
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const STORAGE_KEY = '__ai_phase2_pending';
-  const IMAGES_KEY = '__ai_pending_images';
+  if (window.__ai_filler_loaded) return;
+  window.__ai_filler_loaded = true;
+  let currentJob = null;
+  let cancelled = false;
+  let uploadBusy = false;
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+  async function call(action, fields = {}) {
+    const result = await chrome.runtime.sendMessage({ action, transferId: currentJob?.id, ...fields });
+    if (!result?.success) throw Error(result?.error || 'Няма отговор от разширението.');
+    return result;
+  }
+  async function assertOwned() {
+    if (cancelled || !currentJob) throw Error('Прехвърлянето е отменено.');
+    await call('CHECK_TRANSFER');
+    if (cancelled) throw Error('Прехвърлянето е отменено.');
+  }
+  async function sleep(ms) {
+    await delay(ms);
+    if (currentJob) await assertOwned();
+  }
+  function cancel() {
+    cancelled = true;
+    for (const id of ['__ai_imgs', '__ai_step2']) document.getElementById(id)?.remove();
+  }
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.importState && currentJob) {
+      const jobs = Object.values(changes.importState.newValue?.transfers || {});
+      if (!jobs.some(job => job.id === currentJob.id)) cancel();
+    }
+  });
+  const escapeHtml = value => String(value).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 
   function setVal(el, val) {
+    if (cancelled) throw Error('Прехвърлянето е отменено.');
     if (!el) return false;
     const tag = el.tagName;
     const proto = tag === 'SELECT' ? HTMLSelectElement.prototype
@@ -28,10 +57,11 @@
     for (const o of sel.options) if (o.value === v || o.text.trim() === v) { setVal(sel, o.value); return true; }
     const t = v.toLowerCase();
     for (const o of sel.options) if (o.text.trim().toLowerCase() === t) { setVal(sel, o.value); return true; }
-    for (const o of sel.options) {
-      const ot = o.text.trim().toLowerCase();
-      if (ot.length > 1 && (ot.includes(t) || t.includes(ot))) { setVal(sel, o.value); return true; }
-    }
+    const matches = [...sel.options].filter(o => {
+      const text = o.text.trim().toLowerCase();
+      return o.value !== '' && text.length > 1 && (text.includes(t) || t.includes(text));
+    });
+    if (matches.length === 1) { setVal(sel, matches[0].value); return true; }
     return false;
   }
 
@@ -44,58 +74,88 @@
     for (const o of opts) if (o.text.trim().toLowerCase() === clean) { setVal(sel, o.value); return true; }
     const prefixes = opts.filter(o => {
       const ot = o.text.trim().toLowerCase();
-      return ot.length > 1 && (rawL.startsWith(ot) || clean.startsWith(ot));
+      return ot.length > 1 && [rawL, clean].some(value => value === ot || value.startsWith(ot + ' '));
     }).sort((a, b) => b.text.length - a.text.length);
-    if (prefixes.length) { setVal(sel, prefixes[0].value); return true; }
+    if (prefixes.length && (!prefixes[1] || prefixes[0].text.length > prefixes[1].text.length)) { setVal(sel, prefixes[0].value); return true; }
     const parts = clean.split(' ').filter(w => w.length > 1).slice(0, 2);
     if (parts.length >= 2) {
       const phrase = parts.join(' ');
-      for (const o of opts) if (o.text.trim().toLowerCase().includes(phrase)) { setVal(sel, o.value); return true; }
+      const matches = opts.filter(o => o.text.trim().toLowerCase().includes(phrase));
+      if (matches.length === 1) { setVal(sel, matches[0].value); return true; }
     }
     return false;
   }
 
   const q = name => document.querySelector(`[name="${name}"]`);
-
-  function checkByExactValue(val) {
-    const all = document.querySelectorAll('input[type="checkbox"]');
-    for (const cb of all) if (cb.value.trim() === val.trim()) {
-      if (!cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
-      return true;
+  const formIdentity = () => ({ make: q('f5')?.value, model: q('f6')?.value, year: q('f15')?.value, vin: q('f32')?.value });
+  function identityChanged() {
+    return currentJob?.formIdentity && Object.entries(currentJob.formIdentity).some(([key, value]) => formIdentity()[key] !== value);
+  }
+  // Editing the vehicle after filling invalidates automatic images for that car.
+  // Keep the user's edits; never silently attach the old vehicle's images.
+  for (const event of ['input', 'change', 'click', 'submit']) document.addEventListener?.(event, () => {
+    if (!cancelled && currentJob?.phase === 'images' && q('f5') && identityChanged()) {
+      cancel();
+      call('TRANSFER_FAILED', { error: 'Автомобилът е редактиран. Снимките са спрени; започни ново прехвърляне.' }).catch(() => {});
+      ui('Автомобилът е редактиран. Автоматичните снимки са спрени.', 'warning');
     }
-    return false;
-  }
-  function checkByFuzzy(val) {
-    const key = val.trim().toLowerCase().substring(0, 20);
-    const all = document.querySelectorAll('input[type="checkbox"]');
-    for (const cb of all) {
-      const cv = cb.value.trim().toLowerCase();
-      if (cv.length > 3 && cv.startsWith(key.substring(0, Math.min(key.length, cv.length)))) {
-        if (!cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
-        return true;
-      }
-    }
-    return false;
-  }
-  function checkByName(name) {
-    const cb = document.querySelector(`input[type="checkbox"][name="${name}"]`);
-    if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); return true; }
-    return false;
-  }
+  }, true);
 
+  function normalized(value) {
+    return String(value || '').normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+  function placeName(value) {
+    return normalized(value).replace(/^(?:обл\.?|област|гр\.?|град|с\.?|село)\s+/, '');
+  }
+  function placeOption(select, value) {
+    if (!select || !value) return null;
+    const options = [...select.options].filter(o => o.value !== '');
+    const exact = options.filter(o => o.value === value || normalized(o.text) === normalized(value));
+    if (exact.length === 1) return exact[0];
+    const matches = options.filter(o => placeName(o.text) === placeName(value));
+    return matches.length === 1 ? matches[0] : null;
+  }
+  async function loadCities() {
+    // Re-query each time: mobile.bg may replace the entire select after region changes.
+    for (let i = 0; i < 24; i++) {
+      const select = q('f19');
+      if (select?.options.length > 1) return select;
+      await sleep(250);
+    }
+    return q('f19');
+  }
+  async function rememberCities(select) {
+    const region = q('f18');
+    const chosen = [...(region?.options || [])].find(o => o.value === region.value);
+    if (!chosen || !region.value || !select) return;
+    const key = placeName(chosen.text);
+    const cities = [...select.options].filter(o => o.value).map(o => ({ value: o.value, label: o.text.trim() }));
+    if (cities.length) await chrome.storage.local.set({ ['mobileCities:' + key]: cities });
+  }
+  function setExtra(value, checked = true) {
+    if (cancelled) throw Error('Прехвърлянето е отменено.');
+    const boxes = [...document.querySelectorAll('input[type="checkbox"]')];
+    const label = cb => cb.labels?.[0]?.textContent || cb.parentElement?.textContent || '';
+    let matches = boxes.filter(cb => normalized(cb.value) === normalized(value) || normalized(label(cb)) === normalized(value));
+    if (!matches.length && value !== '4x4') matches = boxes.filter(cb => [cb.value, label(cb)].some(text => normalized(text).startsWith(normalized(value))));
+    if (!matches.length) {
+      const name = { '4x4':'f85', 'Аларма':'f115', 'Кожен салон':'f122', 'Нов внос':'f98' }[value];
+      if (name) matches = boxes.filter(cb => cb.name === name);
+    }
+    if (matches.length !== 1) return false;
+    const cb = matches[0];
+    if (!!cb.checked !== checked) {
+      cb.checked = checked;
+      cb.dispatchEvent(new Event('input', { bubbles: true }));
+      cb.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return true;
+  }
   const FUEL = { бензин:'Бензинов',бензинов:'Бензинов',petrol:'Бензинов',gas:'Бензинов',gasoline:'Бензинов',дизел:'Дизелов',дизелов:'Дизелов',diesel:'Дизелов',електрически:'Електрически',electric:'Електрически',ev:'Електрически',хибриден:'Хибриден',hybrid:'Хибриден',phev:'Plug-in хибрид',газ:'Газ',lpg:'Газ',cng:'Газ' };
   const TRANS = { автоматична:'Автоматична',автомат:'Автоматична',automatic:'Автоматична',ръчна:'Ръчна',механична:'Ръчна',manual:'Ръчна' };
-  const BODY = { седан:'Седан',sedan:'Седан',хечбек:'Хечбек',hatchback:'Хечбек',комби:'Комби',wagon:'Комби',estate:'Комби',купе:'Купе',coupe:'Купе',кабрио:'Кабрио',convertible:'Кабрио',ван:'Ван',van:'Ван',миниван:'Миниван',minivan:'Миниван',пикап:'Пикап',pickup:'Пикап',джип:'Джип',suv:'Джип',crossover:'Джип' };
+  const BODY = { седан:'Седан',sedan:'Седан',хечбек:'Хечбек',hatchback:'Хечбек',комби:'Комби',wagon:'Комби',estate:'Комби',купе:'Купе',coupe:'Купе',кабриолет:'Кабрио',кабрио:'Кабрио',convertible:'Кабрио',ван:'Ван',van:'Ван',миниван:'Миниван',minivan:'Миниван',пикап:'Пикап',pickup:'Пикап',джип:'Джип',suv:'Джип',crossover:'Джип' };
   const COLOR = { white:'Бял',black:'Черен',silver:'Сребърен',gray:'Сив',grey:'Сив',red:'Червен',blue:'Син',green:'Зелен',brown:'Кафяв',beige:'Бежов',gold:'Златист',yellow:'Жълт',orange:'Оранжев',purple:'Виолетов',maroon:'Бордо',pearl:'Перла',champagne:'Кремав',charcoal:'Графит',tan:'Бежов',ivory:'Кремав',бял:'Бял',черен:'Черен',сребърен:'Сребърен',сив:'Сив',червен:'Червен',син:'Син',зелен:'Зелен',кафяв:'Кафяв',бежов:'Бежов',сребрист:'Сребърен' };
   const MONTHS = { january:'януари',february:'февруари',march:'март',april:'април',may:'май',june:'юни',july:'юли',august:'август',september:'септември',october:'октомври',november:'ноември',december:'декември',1:'януари',2:'февруари',3:'март',4:'април',5:'май',6:'юни',7:'юли',8:'август',9:'септември',10:'октомври',11:'ноември',12:'декември' };
-  const ALL_MONTHS = ['януари','февруари','март','април','май','юни','юли','август','септември','октомври','ноември','декември'];
-
-  function getEuro(year) {
-    const y = parseInt(year) || 0;
-    if (y >= 2015) return '6'; if (y >= 2011) return '5'; if (y >= 2006) return '4';
-    if (y >= 2001) return '3'; if (y >= 1997) return '2'; return '1';
-  }
-
   function buildDesc(data, template) {
     if (template && template.trim()) {
       return template
@@ -106,7 +166,7 @@
         .replace(/\{кубатура\}/gi, data.displacement ? data.displacement + ' сс' : '')
         .replace(/\{мощност\}/gi, data.horsepower ? data.horsepower + ' к.с.' : '')
         .replace(/\{цилиндри\}/gi, data.cylinders || '')
-        .replace(/\{пробег\}/gi, data.odometerKm ? data.odometerKm.toLocaleString() + ' км' : '')
+        .replace(/\{пробег\}/gi, data.odometerKm != null ? data.odometerKm.toLocaleString() + ' км' : '')
         .replace(/\{гориво\}/gi, data.fuel || '')
         .replace(/\{трансмисия\}/gi, data.transmission || '')
         .replace(/\{задвижване\}/gi, data.drive || '')
@@ -116,7 +176,7 @@
         .replace(/\{лот\}/gi, data.lotNumber || data.stockNumber || '')
         .replace(/\{пазарна\}/gi, data.estimatedValue || '')
         .replace(/\{забележки\}/gi, data.highlights || '')
-        .replace(/\{щета\}/gi, ''); // щетата никога не се пише в описанието
+        .replace(/\{щета\}/gi, [data.primaryDamage, data.secondaryDamage].filter(Boolean).join('; '));
     }
     const L = [];
     L.push(`🚗 ${data.title || `${data.year} ${data.make} ${data.model}`.trim()}`);
@@ -131,9 +191,10 @@
     }
     if (data.transmission) L.push(`⚙️ Скоростна кутия: ${data.transmission}`);
     if (data.drive) L.push(`🔩 Задвижване: ${data.drive}`);
-    if (data.odometerKm) L.push(`🛣️ Пробег: ${data.odometerKm.toLocaleString()} км`);
+    if (data.odometerKm != null) L.push(`🛣️ Пробег: ${data.odometerKm.toLocaleString()} км`);
     if (data.color) L.push(`🎨 Цвят: ${data.color}`);
     L.push('');
+    if (data.primaryDamage || data.secondaryDamage) L.push(`Щети по данни от аукциона: ${[data.primaryDamage, data.secondaryDamage].filter(Boolean).join('; ')}`);
     if (data.vin) L.push(`🔑 VIN: ${data.vin}`);
     L.push('');
     L.push('За повече информация и огледи – свържете се с нас!');
@@ -142,23 +203,20 @@
 
   function getExtras(data) {
     const toCheck = [];
-    const make = (data.make || '').toLowerCase();
     const hl = (data.highlights || '').toLowerCase();
-    const yr = parseInt(data.year) || 0;
-    const isLux = /mercedes|bmw|audi|lexus|infiniti|cadillac|lincoln|rolls.royce|bentley|porsche|jaguar|land.rover|maserati|genesis|volvo|acura/.test(make);
     const drive = (data.drive || '').toLowerCase();
-    const is4x4 = drive === '4x4' || /4wd|awd|all.wheel|4x4|4matic|quattro|xdrive/.test(drive + (data.title||'').toLowerCase() + (data.highlights||'').toLowerCase());
+    const is4x4 = /^(4x4|4wd|awd|all[ -]wheel(?: drive)?|four[ -]wheel(?: drive)?)$/.test(drive);
 
-    if (yr >= 2000) {
+    {
       toCheck.push('Адаптивни предни светлини','Антиблокираща система','Въздушни възглавници - Задни','Въздушни възглавници - Предни','Въздушни възглавници - Странич','Ел. разпределяне на спирачното','Електронна програма за стабили','Контрол на налягането на гумит','Парктроник','Система ISOFIX','Система за динамична устойчиво','Система за защита от пробуксув','Система за контрол на дистанци','Система за контрол на спускане');
     }
-    if (yr >= 2005) {
+    {
       toCheck.push('360 camera \\ Задна камера','Apple CarPlay \\ Android Auto','Auto Start Stop function','Bluetooth \\ handsfree система','DVD, TV','Head up display','USB, audio\\video, IN\\AUX извод','Адаптивно въздушно окачване','Блокаж на диференциала','Бързи \\ бавни скорости','Вентилация на седалките','Датчик за светлина','Ел. Огледала','Ел. Стъкла','Ел. регулиране на седалките','Климатик','Мултифункционален волан','Навигация','Печка','Подгряване на предното стъкло','Подгряване на седалките','Регулиране на волана','Сензор за дъжд','Серво усилвател на волана','Система за измиване на фаровет','Система за контрол на скоростт','Хладилна жабка');
     }
     toCheck.push('Аларма','Кожен салон','Нов внос');
     if (is4x4) toCheck.push('4x4');
-    if (isLux) toCheck.push('Климатроник','LED фарове','Лети джанти','Металик');
-    if (/mercedes|bmw/.test(make) && yr >= 2010) toCheck.push('Steptronic, Tiptronic');
+    toCheck.push('Климатроник','LED фарове','Лети джанти','Металик');
+    toCheck.push('Steptronic, Tiptronic');
     const bodyLow = (data.bodyType || '').toLowerCase();
     toCheck.push(['купе','кабрио'].some(b => bodyLow.includes(b)) ? '2(3) Врати' : '4(5) Врати');
     if (/sunroof|moonroof|panoram/.test(hl)) toCheck.push('Панорамен люк','Шибедах');
@@ -179,36 +237,25 @@
 
     // Населено място
     try {
-      const f19 = q('f19');
-      if (f19) {
-        for (let i = 0; i < 20; i++) { if (f19.options.length > 1) break; await sleep(250); }
-        const city = settings.city || 'София';
-        if (!pickVal(f19, city)) {
-          const cityLow = city.toLowerCase();
-          let matched = false;
-          for (const o of f19.options) {
-            if (o.text.toLowerCase().includes(cityLow)) { setVal(f19, o.value); matched = true; break; }
-          }
-          if (!matched) {
-            const first = [...f19.options].find(o => o.value !== '');
-            if (first) setVal(f19, first.value);
-          }
-        }
-        n++;
-      }
+      const f19 = await loadCities();
+      await rememberCities(f19);
+      const city = settings.city || 'София';
+      const option = placeOption(f19, city);
+      if (option) { setVal(f19, option.value); n++; }
+      else ui('Населеното място не е намерено в избрания регион: ' + city, 'warning');
     } catch (e) { console.error('[AI] f19 грешка:', e); }
 
     try {
       if (settings.phone) { setVal(q('f22'), settings.phone); n++; }
       if (settings.email) { const f23 = q('f23'); if (f23 && !f23.value) setVal(f23, settings.email); }
-      if (data.vin) { setVal(q('f32'), data.vin); n++; }
+      if (/^[A-HJ-NPR-Z0-9]{17}$/i.test(data.vin || '')) { if (setVal(q('f32'), data.vin)) n++; }
     } catch (e) { console.error('[AI] phone/email/vin грешка:', e); }
 
     ui('📝 Попълвам описание...', 'loading');
     let descOk = false;
     try {
       const ta = q('f21');
-      if (ta) { setVal(ta, buildDesc(data, settings.descTemplate || '')); n++; descOk = true; }
+      if (ta) { setVal(ta, buildDesc({ ...data, horsepower: settings.horsepower || data.horsepower }, settings.descTemplate || '')); n++; descOk = true; }
     } catch (e) { console.error('[AI] Описание грешка:', e); }
 
     ui((descOk ? '✅ Описание OK. ' : '❌ f21 НЕ Е НАМЕРЕНА! ') + 'Маркирам екстри...', descOk ? 'loading' : 'warning');
@@ -218,26 +265,18 @@
     try {
       const extras = getExtras(data);
       for (const val of extras) {
-        if (checkByExactValue(val)) { cnt++; continue; }
-        if (checkByFuzzy(val)) { cnt++; continue; }
-        if (val === 'Нов внос') { checkByName('f98'); cnt++; }
-        else if (val === '4x4') { checkByName('f85'); cnt++; }
-        else if (val === 'Аларма') { checkByName('f115'); cnt++; }
-        else if (val === 'Кожен салон') { checkByName('f122'); cnt++; }
+        if (setExtra(val)) { cnt++; continue; }
+
       }
+      setExtra('4x4', extras.includes('4x4'));
       if (cnt > 0) n++;
     } catch (e) { console.error('[AI] Checkboxes грешка:', e); }
 
     console.log('[AI-FILL] ФАЗА 2 ЗАВЪРШИ. n=', n, 'cnt=', cnt);
-    ui(`✅ Попълнени ${n} полета, ${cnt} екстри! Натисни ПРОДЪЛЖИ → снимките ще се качат автоматично.`, 'done');
+    await assertOwned();
+    currentJob = (await call('FORM_FILLED', { formIdentity: formIdentity() })).transfer;
+    ui(`Попълнени ${n} полета. Приложен е запазеният пресет за екстри. Провери стойностите и Евро категорията. Натисни ПРОДЪЛЖИ за снимките.`, 'done');
     showImgs(data.images || []);
-    chrome.storage.local.remove(STORAGE_KEY);
-    // Запази снимките отделно – ще ги ползваме автоматично на стъпка 2 (качване на снимки)
-    try {
-      if (data.images && data.images.length) {
-        chrome.storage.local.set({ [IMAGES_KEY]: data.images });
-      }
-    } catch (e) { console.warn('[AI] Не успях да запазя снимките за стъпка 2:', e); }
   }
 
   // ════════════════════════════════════════
@@ -250,24 +289,24 @@
     await sleep(300);
 
     const f5 = q('f5');
-    if (!f5) {
-      console.error('[AI-FILL] f5 НЕ Е НАМЕРЕН – СПИРАМ ВЕДНАГА');
-      ui('⚠️ Отиди на формата за публикуване в mobile.bg', 'warning');
-      return;
+    if (!f5) throw Error('Отиди на формата за нова обява в mobile.bg.');
+    if (f5.value || q('f32')?.value || q('f21')?.value) {
+      throw Error('Формата вече съдържа данни. Започни от аукционния таб в нова форма, за да не смесиш обяви.');
     }
+    await assertOwned();
 
     let n = 0;
 
     if (data.make && pickVal(f5, data.make)) {
       n++;
-      f5.dispatchEvent(new Event('change', { bubbles: true }));
-      if (typeof f5.onchange === 'function') f5.onchange.call(f5);
       const f6 = q('f6');
       if (f6) for (let i = 0; i < 25; i++) { if (f6.options.length > 1) break; await sleep(200); }
     }
-    if (data.model) { const f6 = q('f6'); if (f6 && f6.options.length > 1 && pickModel(f6, data.model)) n++; }
+    if (!n) throw Error('Марката не е намерена. Провери обявата.');
+    if (!data.model || !pickModel(q('f6'), data.model)) throw Error('Моделът липсва или е нееднозначен. Провери го ръчно.');
+    n++;
     if (data.fuel && pickVal(q('f8'), FUEL[data.fuel.toLowerCase()] || data.fuel)) n++;
-    pickVal(q('f25'), '0'); n++; // Винаги "Употребяван" – не отбелязваме щета/повреда
+    // Condition and emissions require manual verification; do not infer them.
     // f9: Конски сили – settings имат приоритет над извлечените данни
     {
       const hp = settings.horsepower || data.horsepower || '';
@@ -279,11 +318,10 @@
       const mod = settings.modification || data.series || '';
       if (mod) { const f7=q('f7'); if (f7) { setVal(f7, mod); n++; } }
     }
-    if (data.year && pickVal(q('f29'), getEuro(data.year))) n++;
     if (data.transmission && pickVal(q('f10'), TRANS[data.transmission.toLowerCase()] || data.transmission)) n++;
     if (data.bodyType && pickVal(q('f11'), BODY[data.bodyType.toLowerCase()] || data.bodyType)) n++;
     if (data.displacement) { const f30=q('f30'); if (f30) { setVal(f30, data.displacement); n++; } }
-    if (data.odometerKm) { setVal(q('f16'), String(data.odometerKm)); n++; }
+    if (data.odometerKm != null) { setVal(q('f16'), String(data.odometerKm)); n++; }
     if (data.year && pickVal(q('f15'), data.year)) n++;
 
     {
@@ -292,9 +330,12 @@
         let mBG = null;
         if (data.productionMonth) {
           const k = String(data.productionMonth).toLowerCase().trim();
-          mBG = MONTHS[k] || MONTHS[parseInt(k)];
+          mBG = MONTHS[k] || (/^0?[1-9]$|^1[0-2]$/.test(k) ? MONTHS[Number(k)] : null);
         }
-        if (!mBG) mBG = ALL_MONTHS[Math.floor(Math.random() * ALL_MONTHS.length)];
+        if (!data.productionMonth) {
+          const months = Array.from({ length: 12 }, (_, i) => MONTHS[i + 1]);
+          mBG = months[Math.floor(Math.random() * months.length)];
+        }
         if (pickVal(f14, mBG)) n++;
       }
     }
@@ -302,9 +343,11 @@
     if (settings.price) {
       setVal(q('f12'), settings.price);
       if (settings.currency) pickVal(q('f13'), settings.currency);
-      pickVal(q('f31'), '1');
       n++;
     }
+
+    // Explicit user preset: sale price includes VAT, independently of a default price.
+    if (pickVal(q('f31'), 'Цената е с включено ДДС') || pickVal(q('f31'), '1')) n++;
 
     if (data.color || data.colorOriginal) {
       const key = (data.colorOriginal || data.color || '').toLowerCase().trim();
@@ -312,31 +355,18 @@
       if (bg && pickVal(q('f17'), bg)) n++;
     }
 
-    // ── РЕГИОН: mobile.bg прави document.pub.submit() (form POST + reload)
-    // при ВСЯКА промяна на f18, независимо дали е реален клик или скрипт.
-    // Затова: ако вече има стойност – не пипаме нищо, директно Фаза 2.
-    // Ако е празно – запазваме всичко в sessionStorage, сменяме региона
-    // (което ще доведе до reload), и продължаваме автоматично след зареждането.
+    // Preserve the baseline region-triggered reload, with tab-owned progress.
     const region = settings.region || 'София';
     const f18el = q('f18');
-
-    if (f18el && f18el.value) {
-      // Регионът вече е избран – директно продължаваме без презареждане.
-      await runPhase2(data, settings, n);
+    const regionOption = placeOption(f18el, region);
+    if (region && f18el && regionOption?.value !== f18el.value) {
+      await assertOwned();
+      await call('SAVE_PHASE2', { n, formIdentity: formIdentity() });
+      ui('Избирам регион. Попълването продължава след презареждане.', 'loading');
+      if (!regionOption) throw Error('Регионът не е намерен. Избери го ръчно и започни в нова форма.');
+      setVal(f18el, regionOption.value);
       return;
     }
-
-    if (f18el && !f18el.value) {
-      // Запази прогреса в chrome.storage.local (преживява page reload, sessionStorage не!)
-      try {
-        await chrome.storage.local.set({ [STORAGE_KEY]: { data, settings, n } });
-      } catch (e) { console.error('[AI] storage save грешка:', e); }
-      ui('🔄 Избирам регион (страницата ще се презареди автоматично)...', 'loading');
-      pickVal(f18el, region);
-      return;
-    }
-
-    // Ако f18 изобщо липсва (нестандартна страница) – пробвай директно Фаза 2.
     await runPhase2(data, settings, n);
   }
 
@@ -352,7 +382,7 @@
     // (vis.iaai.com, cs.copart.com), защото те не разрешават mobile.bg origin.
     // Затова искаме background worker-а (extension-privileged контекст) да го
     // изтегли вместо нас и да ни върне base64 данните.
-    const resp = await chrome.runtime.sendMessage({ action: 'FETCH_IMAGE_AS_BASE64', url });
+    const resp = await chrome.runtime.sendMessage({ action: 'FETCH_IMAGE_AS_BASE64', transferId: currentJob?.id, url });
     if (!resp || !resp.success) {
       throw new Error(resp?.error || 'Неуспешно изтегляне през background worker');
     }
@@ -363,40 +393,35 @@
 
   // Автоматично инжектирай снимките в <input type="file"> чрез DataTransfer API
   async function autoUploadImages(images, statusEl) {
-    const input = findFileInput();
-    if (!input) {
-      statusEl.textContent = '⚠️ Не намерих поле за качване на снимки на тази страница. Отиди на стъпка 2 ("Добавяне на снимки") и опитай пак.';
-      return false;
-    }
-
-    const dt = new DataTransfer();
-    let okCount = 0, failCount = 0;
-
-    for (let i = 0; i < images.length; i++) {
-      statusEl.textContent = `⏳ Обработвам снимка ${i + 1}/${images.length}...`;
-      try {
-        const file = await urlToFile(images[i], `car_${String(i + 1).padStart(2, '0')}.jpg`);
-        dt.items.add(file);
-        okCount++;
-      } catch (e) {
-        console.warn('[AI] Снимка не успя (CORS или мрежа):', images[i], e.message);
-        failCount++;
+    if (uploadBusy) return false;
+    uploadBusy = true;
+    try {
+      await assertOwned();
+      const input = findFileInput();
+      if (!input) throw Error('Отиди на стъпката за добавяне на снимки.');
+      if (input.files?.length) throw Error('Вече има избрани снимки. Провери ги и ги премахни ръчно преди повторен опит.');
+      const availableCount = images.length;
+      images = images.slice(0, 17); // mobile.bg limit shown on the upload form.
+      const dt = new DataTransfer();
+      let failures = 0;
+      for (let i = 0; i < images.length; i++) {
+        await assertOwned();
+        statusEl.textContent = `Обработвам снимка ${i + 1}/${images.length}...`;
+        try { dt.items.add(await urlToFile(images[i], `car_${String(i + 1).padStart(2, '0')}.jpg`)); }
+        catch (e) { failures++; console.warn('[AI] Image:', e.message); }
       }
-    }
-
-    if (okCount === 0) {
-      statusEl.textContent = '❌ Снимките не се качиха автоматично. Провери конзолата (F12) за детайли или използвай ръчно сваляне по-долу.';
+      await assertOwned();
+      if (!dt.files.length) throw Error('Снимките не се изтеглиха. Опитай отново или ги добави ръчно.');
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      currentJob = (await call('IMAGES_ASSIGNED')).transfer;
+      statusEl.textContent = `Предадени ${dt.files.length}/${images.length} снимки на формата${failures ? ` (${failures} неуспешни)` : ''}. Провери качването в mobile.bg.${availableCount > 17 ? ' Използвани са първите 17 снимки — лимитът на формата.' : ''}`;
+      return true;
+    } catch (e) {
+      statusEl.textContent = e.message;
       return false;
-    }
-
-    input.files = dt.files;
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-
-    statusEl.textContent = failCount > 0
-      ? `✅ Качени ${okCount} от ${images.length} снимки автоматично (${failCount} не успяха).`
-      : `✅ Всички ${okCount} снимки са качени автоматично!`;
-    return true;
+    } finally { uploadBusy = false; }
   }
 
   function showImgs(images) {
@@ -411,7 +436,7 @@
         <button id="__ai_c" style="background:none;border:none;color:#475569;cursor:pointer;font-size:22px;line-height:1">×</button>
       </div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-bottom:12px">
-        ${images.slice(0,9).map((u,i)=>`<div style="position:relative"><img src="${u}" style="width:100%;height:58px;object-fit:cover;border-radius:5px;border:2px solid rgba(99,102,241,.4)" onerror="this.style.opacity='.2'"><div style="position:absolute;bottom:2px;right:2px;background:rgba(0,0,0,.65);color:#fff;font-size:9px;padding:1px 3px;border-radius:2px">${i+1}</div></div>`).join('')}
+        ${images.slice(0,9).map((u,i)=>`<div style="position:relative"><img src="${escapeHtml(u)}" style="width:100%;height:58px;object-fit:cover;border-radius:5px;border:2px solid rgba(99,102,241,.4)" onerror="this.style.opacity='.2'"><div style="position:absolute;bottom:2px;right:2px;background:rgba(0,0,0,.65);color:#fff;font-size:9px;padding:1px 3px;border-radius:2px">${i+1}</div></div>`).join('')}
       </div>
       <button id="__ai_auto" style="width:100%;padding:10px;background:linear-gradient(135deg,#059669,#0d9488);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;margin-bottom:7px">🚀 Качи автоматично (отиди на стъпка 2 първо)</button>
       <div id="__ai_status" style="font-size:12px;color:#94a3b8;margin-bottom:8px;min-height:16px"></div>
@@ -432,6 +457,7 @@
     document.getElementById('__ai_dl').addEventListener('click', function () {
       this.disabled = true; this.textContent = '⏳ Изтеглям...';
       images.forEach((url, i) => setTimeout(() => {
+        if (cancelled) return;
         const a = document.createElement('a');
         a.href = url; a.download = `car_${String(i+1).padStart(2,'0')}.jpg`; a.target = '_blank';
         document.body.appendChild(a); a.click(); a.remove();
@@ -439,6 +465,7 @@
       }, i * 500));
     });
     document.getElementById('__ai_cp').addEventListener('click', function () {
+      if (cancelled) return;
       navigator.clipboard.writeText(images.join('\n')).then(() => {
         this.textContent = '✅ Копирано!'; setTimeout(() => this.textContent = '📋 Копирай линковете', 2500);
       });
@@ -455,78 +482,37 @@
       document.body.appendChild(el);
     }
     el.style.borderLeft = `4px solid ${C[type]||C.loading}`;
-    el.innerHTML = `<div style="display:flex;gap:10px;align-items:flex-start"><span style="font-size:20px;flex-shrink:0">${I[type]||'⏳'}</span><div style="flex:1"><b style="color:#fff;display:block;margin-bottom:2px">AutoImport BG</b><span style="color:#94a3b8;font-size:13px">${msg}</span></div><button onclick="document.getElementById('__ai_ui').remove()" style="background:none;border:none;color:#475569;cursor:pointer;font-size:22px;padding:0;flex-shrink:0;line-height:1">×</button></div>`;
+    el.innerHTML = `<div style="display:flex;gap:10px;align-items:flex-start"><span style="font-size:20px;flex-shrink:0">${I[type]||'⏳'}</span><div style="flex:1"><b style="color:#fff;display:block;margin-bottom:2px">AutoImport BG</b><span style="color:#94a3b8;font-size:13px">${escapeHtml(msg)}</span></div><button onclick="document.getElementById('__ai_ui').remove()" style="background:none;border:none;color:#475569;cursor:pointer;font-size:22px;padding:0;flex-shrink:0;line-height:1">×</button></div>`;
     if (type === 'success') setTimeout(() => el?.remove(), 4000);
   }
 
-  // ════════════════════════════════════════
-  // AUTO-RESUME: при ново зареждане на страницата (след презареждането,
-  // причинено от document.pub.submit()), провери дали имаме недовършена
-  // Фаза 2 в sessionStorage и я довърши автоматично.
-  // ════════════════════════════════════════
-  (async function autoResume() {
-    let pending;
-    try {
-      const r = await chrome.storage.local.get(STORAGE_KEY);
-      pending = r[STORAGE_KEY] || null;
-    } catch (e) { pending = null; }
-    if (!pending) return;
-
-    console.log('[AI-FILL] Открит недовършен прогрес след презареждане – продължавам Фаза 2 автоматично.');
-    await sleep(1200); // изчакай новата страница да рендира напълно
-
-    if (!q('f5')) {
-      console.warn('[AI-FILL] autoResume: f5 липсва на новата страница, изчиствам прогреса.');
-      chrome.storage.local.remove(STORAGE_KEY);
+  async function boot() {
+    const result = await call('GET_TRANSFER');
+    if (!result.transfer) {
+      if (q('f18')) await rememberCities(await loadCities());
       return;
     }
-
-    ui('🔄 Продължавам попълването след презареждане...', 'loading');
-    await runPhase2(pending.data, pending.settings, pending.n);
-  })();
-
-  // ════════════════════════════════════════
-  // СТЪПКА 2: плаващ бутон за снимки
-  // Показва се на всяка страница с file input (стъпка 2 на mobile.bg).
-  // Ако има IMAGES_KEY в sessionStorage – опитва автоматично качване.
-  // Ако потребителят се върне обратно – бутонът е винаги видим за повторен опит.
-  // ════════════════════════════════════════
-  (async function handleStep2() {
-    // Изчакай до 4 сек file input да се появи
-    let input = null;
-    for (let i = 0; i < 14; i++) {
-      input = findFileInput();
-      if (input) break;
-      await sleep(300);
+    currentJob = result.transfer;
+    if (currentJob.phase === 'phase2') {
+      await sleep(1200);
+      if (!q('f5')) return; // An unrelated page must not consume the job.
+      if (!currentJob.formIdentity || identityChanged()) {
+        throw Error('Автомобилът във формата е сменен. Автоматичното продължаване е спряно.');
+      }
+      const claimed = await call('CLAIM_TRANSFER', { resume: true });
+      currentJob = claimed.transfer;
+      await runPhase2(currentJob.data, currentJob.settings, currentJob.n);
+    } else if (['images', 'imagesAssigned'].includes(currentJob.phase)) {
+      for (let i = 0; i < 14 && !findFileInput(); i++) await sleep(300);
+      if (!findFileInput()) return;
+      showStep2Panel(currentJob.data.images);
+      if (currentJob.phase === 'images' && currentJob.data.images.length) {
+        await autoUploadImages(currentJob.data.images, {
+          set textContent(value) { const el = document.getElementById('__ai_s2_status'); if (el) el.textContent = value; }
+        });
+      }
     }
-    if (!input) return; // не сме на стъпка 2
-
-    // Вземи снимките от sessionStorage (ако има)
-    let images;
-    try {
-      const r = await chrome.storage.local.get(IMAGES_KEY);
-      images = r[IMAGES_KEY] || null;
-    } catch (e) { images = null; }
-
-    // Покажи плаващия панел
-    showStep2Panel(images || []);
-
-    // Ако има чакащи снимки – опитай автоматично качване
-    if (images && images.length) {
-      const panel = document.getElementById('__ai_step2');
-      const statusEl = panel?.querySelector('#__ai_s2_status');
-      if (statusEl) statusEl.textContent = `⏳ Качвам ${images.length} снимки автоматично...`;
-
-      const ok = await autoUploadImages(images, {
-        set textContent(v) {
-          const el = document.getElementById('__ai_s2_status');
-          if (el) el.textContent = v;
-        }
-      });
-
-      if (ok) chrome.storage.local.remove(IMAGES_KEY);
-    }
-  })();
+  }
 
   function showStep2Panel(images) {
     document.getElementById('__ai_step2')?.remove();
@@ -550,7 +536,7 @@
       <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-bottom:10px">
         ${images.slice(0,8).map((u,i)=>`
           <div style="position:relative">
-            <img src="${u}" style="width:100%;height:44px;object-fit:cover;border-radius:4px;border:1px solid rgba(255,255,255,.1)" onerror="this.style.opacity='.2'">
+            <img src="${escapeHtml(u)}" style="width:100%;height:44px;object-fit:cover;border-radius:4px;border:1px solid rgba(255,255,255,.1)" onerror="this.style.opacity='.2'">
             <div style="position:absolute;bottom:1px;right:2px;background:rgba(0,0,0,.7);color:#fff;font-size:8px;padding:0 2px;border-radius:2px">${i+1}</div>
           </div>`).join('')}
       </div>` : `
@@ -585,9 +571,8 @@
         set textContent(v) { if (statusEl) statusEl.textContent = v; }
       });
       if (ok) {
-        chrome.storage.local.remove(IMAGES_KEY);
         this.style.background = 'linear-gradient(135deg,#1d4ed8,#4f46e5)';
-        this.textContent = `✅ Качени! Натисни ПРОДЪЛЖИ.`;
+        this.textContent = `Предадени на формата — провери снимките.`;
       } else {
         this.disabled = false;
         this.textContent = `🔄 Опитай отново (${images.length} снимки)`;
@@ -597,6 +582,7 @@
     document.getElementById('__ai_s2_dl').addEventListener('click', function () {
       this.disabled = true; this.textContent = '⏳ Изтеглям...';
       images.forEach((url, i) => setTimeout(() => {
+        if (cancelled) return;
         const a = document.createElement('a');
         a.href = url; a.download = `car_${String(i+1).padStart(2,'0')}.jpg`;
         a.target = '_blank'; document.body.appendChild(a); a.click(); a.remove();
@@ -607,17 +593,24 @@
     });
   }
 
-  // Единствен listener – директно изпълнение
-  if (!window.__ai_listener_registered) {
-    window.__ai_listener_registered = true;
-    chrome.runtime.onMessage.addListener((msg, _, sendResponse) => {
-      if (msg.action === 'START_FILL') {
-        console.log('[AI-FILL] START_FILL получено.');
-        fill(msg.data, msg.settings).catch(e => { console.error('[AI-FILL] FATAL:', e); ui('❌ ' + e.message, 'error'); });
-        sendResponse({ success: true });
-        return true;
-      }
-      if (msg.action === 'PING') { sendResponse({ active: true }); return true; }
-    });
+  async function fail(error) {
+    if (currentJob && !cancelled) await call('TRANSFER_FAILED', { error: error.message }).catch(() => {});
+    ui(error.message, 'error');
   }
+  chrome.runtime.onMessage.addListener((msg, _, sendResponse) => {
+    if (msg.action === 'CANCEL_TRANSFER') { cancel(); sendResponse({ success: true }); return; }
+    if (msg.action === 'START_FILL') {
+      if (cancelled || currentJob?.phase !== 'created' && currentJob) {
+        sendResponse({ success: false, error: 'Прехвърлянето вече е започнато или отменено.' }); return;
+      }
+      startup.then(() => call('CLAIM_TRANSFER', { transferId: msg.transferId })).then(result => {
+        currentJob = result.transfer;
+        sendResponse({ success: true });
+        fill(currentJob.data, currentJob.settings).catch(fail);
+      }).catch(error => sendResponse({ success: false, error: error.message }));
+      return true;
+    }
+    if (msg.action === 'PING') sendResponse({ active: true });
+  });
+  const startup = boot().catch(fail);
 })();

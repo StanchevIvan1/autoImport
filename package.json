@@ -1,0 +1,8 @@
+{
+  "name": "autoimport-bg-regression",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "check": "node tests/check.cjs"
+  }
+}

@@ -1,3 +1,5 @@
+importScripts('transfers.js');
+
 // worker.js v5.2 – auth синхронизиран с реалния Node.js сървър
 // ══════════════════════════════════════════════════════════
 // СМЕНИ AUTH_SERVER с реалния URL на твоя сървър
@@ -149,73 +151,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg.action === 'SAVE_CAR_DATA') {
-    chrome.storage.local.set({ carData: msg.data }, () => sendResponse({ success: true }));
-    return true;
-  }
-  if (msg.action === 'GET_CAR_DATA') {
-    chrome.storage.local.get('carData', r => sendResponse({ data: r.carData || null }));
-    return true;
-  }
-  if (msg.action === 'CLEAR_CAR_DATA') {
-    chrome.storage.local.remove('carData', () => sendResponse({ success: true }));
-    return true;
-  }
-  if (msg.action === 'GET_STATUS') {
-    chrome.storage.local.get('carData', r =>
-      sendResponse({ hasData: !!r.carData, data: r.carData || null }));
-    return true;
-  }
-  if (msg.action === 'OPEN_MOBILE_BG') {
-    chrome.tabs.create({ url: 'https://www.mobile.bg' });
-    sendResponse({ success: true });
-    return true;
-  }
-
-  // Изчакай таба да се зареди и filler listener-ът да е готов, после изпрати START_FILL.
-  // Използва се при отваряне на нов таб от popup-а – worker-ът не спира когато popup-ът се затвори.
-  if (msg.action === 'FILL_WHEN_READY') {
-    const { tabId, data, settings } = msg;
-    (async () => {
-      // 1. Изчакай страницата да завърши зареждане (до 15 сек)
-      for (let i = 0; i < 30; i++) {
-        await new Promise(r => setTimeout(r, 500));
-        try {
-          const tab = await chrome.tabs.get(tabId);
-          if (tab.url && tab.url.includes('login')) return; // не е логнат
-          if (tab.status === 'complete' && tab.url && tab.url.includes('pubtype=1')) break;
-        } catch(e) { return; } // табът е затворен
+  const transferActions = ['BEGIN_SCRAPE', 'SAVE_CAR_DATA', 'GET_CAR_DATA', 'GET_STATUS',
+    'CLEAR_CAR_DATA', 'START_TRANSFER', 'GET_TRANSFER', 'CHECK_TRANSFER', 'CLAIM_TRANSFER',
+    'SAVE_PHASE2', 'FORM_FILLED', 'IMAGES_ASSIGNED', 'TRANSFER_FAILED'];
+  if (transferActions.includes(msg.action)) {
+    AutoImportTransfers.handle(msg, sender).then(result => {
+      if (msg.action === 'START_TRANSFER' && result.success) {
+        const job = result.transfer;
+        if (!result.duplicate) dispatchTransfer(job).catch(console.error);
+        chrome.tabs.update(job.destinationTabId, { active: true }).then(tab =>
+          chrome.windows.update(tab.windowId, { focused: true })).catch(console.error);
       }
-
-      // 2. Инжектирай filler-а
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          files: ['content_scripts/mobile_filler.js']
-        });
-      } catch(e) { /* вероятно вече е инжектиран от manifest */ }
-
-      // 3. PING polling – изчакай listener-ът да се регистрира (до 5 сек)
-      let ready = false;
-      for (let i = 0; i < 20; i++) {
-        await new Promise(r => setTimeout(r, 250));
-        try {
-          const pong = await chrome.tabs.sendMessage(tabId, { action: 'PING' });
-          if (pong?.active) { ready = true; break; }
-        } catch(_) {}
-      }
-
-      // 4. Изпрати START_FILL
-      try {
-        await chrome.tabs.sendMessage(tabId, { action: 'START_FILL', data, settings });
-      } catch(e) {
-        console.error('[Worker] FILL_WHEN_READY: START_FILL неуспешен:', e.message);
-      }
-    })();
-    sendResponse({ ok: true });
+      sendResponse(result);
+    }).catch(error => sendResponse({ success: false, error: error.message }));
     return true;
   }
-
 
   // Изтегли снимка от auction CDN (Copart/IAAI) и я върни като base64.
   // Service worker контекстът има extension host_permissions и не е обвързан
@@ -223,7 +173,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'FETCH_IMAGE_AS_BASE64') {
     (async () => {
       try {
-        const res = await fetch(msg.url);
+        await AutoImportTransfers.authorizeImage(msg, sender);
+        const res = await fetch(msg.url, { signal: AbortSignal.timeout(15000) });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const blob = await res.blob();
         const reader = new FileReader();
@@ -241,6 +192,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
-// !! НЕ инжектираме автоматично при всяко зареждане на mobile.bg !!
-// Само popup.js решава кога да се попълва (чрез INJECT_AND_FILL)
-// Filler-ът сам прави autoStart при нужда (веднъж)
+// The worker owns dispatch before activating a tab can close the popup.
+async function dispatchTransfer(job) {
+  const tabId = job.destinationTabId;
+  const sender = { tab: { id: tabId }, url: 'https://www.mobile.bg/pcgi/mobile.cgi', frameId: 0 };
+  try {
+    let loaded = false;
+    for (let i = 0; i < 30; i++) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const tab = await chrome.tabs.get(tabId);
+      if (!AutoImportTransfers.mobile(tab.url)) throw Error('Отвори формата след вход в mobile.bg.');
+      if (tab.status === 'complete') { loaded = true; break; }
+    }
+    if (!loaded) throw Error('Формата не се зареди навреме.');
+    const check = await AutoImportTransfers.handle({ action: 'CHECK_TRANSFER', transferId: job.id }, sender);
+    if (check.transfer.phase !== 'created') return;
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content_scripts/mobile_filler.js'] });
+    const result = await chrome.tabs.sendMessage(tabId, { action: 'START_FILL', transferId: job.id });
+    if (!result?.success) throw Error(result?.error || 'Попълването не започна.');
+  } catch (error) {
+    await AutoImportTransfers.handle({ action: 'TRANSFER_FAILED', transferId: job.id, error: error.message }, sender).catch(() => {});
+    console.error('[Worker] Transfer:', error.message);
+  }
+}
