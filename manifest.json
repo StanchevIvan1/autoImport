@@ -28,6 +28,7 @@
         "https://*.copart.com/lot/*"
       ],
       "js": [
+        "shared/vehicle.js",
         "content_scripts/copart_scraper.js"
       ],
       "run_at": "document_idle"
@@ -37,10 +38,10 @@
         "https://*.iaai.com/VehicleDetail/*",
         "https://*.iaai.com/vehicles/*",
         "https://*.iaai.com/vehicle/*",
-        "https://*.iaai.com/Search*",
         "https://*.iaai.com/buy/*"
       ],
       "js": [
+        "shared/vehicle.js",
         "content_scripts/iaai_scraper.js"
       ],
       "run_at": "document_idle"

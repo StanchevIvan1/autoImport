@@ -34,6 +34,7 @@ function context(extra = {}) {
   return vm.createContext(sandbox);
 }
 function run(file, ctx, expose = []) {
+  if (file !== 'shared/vehicle.js' && !ctx.AutoImportVehicle) run('shared/vehicle.js', ctx);
   let source = fs.readFileSync(path.join(root, file), 'utf8');
   if (expose.length) source = source.replace(/\}\)\(\);\s*$/, `globalThis.testHooks = { ${expose.join(',')} };\n})();`);
   vm.runInContext(source, ctx, { filename: file });

@@ -6,19 +6,10 @@
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  function milesToKm(value, unit = '') {
-    const raw = String(value).trim();
-    // Unknown/not-actual readings are not a verified distance. Preserve zero.
-    if (/unknown|not actual|exempt|inoperable|not available/i.test(raw)) return null;
-    const match = raw.match(/^([0-9][0-9, ]*)(?:\s*(mi(?:les)?|km|kilomet(?:er|re)s?))?(?:\s|$)/i);
-    if (!match) return null;
-    const number = Number(match[1].replace(/[, ]/g, ''));
-    const units = (match[2] || unit).toLowerCase().trim();
-    if (!Number.isFinite(number)) return null;
-    if (/^(km|kilomet(?:er|re)s?)$/.test(units)) return number;
-    if (/^(mi|miles?)$/.test(units)) return Math.round(number * 1.60934);
-    return null;
-  }
+  const milesToKm = AutoImportVehicle.mileage;
+  let vehicleRoot;
+  const vehicleText = () => vehicleRoot?.innerText || vehicleRoot?.textContent || '';
+  const nodes = selector => vehicleRoot?.querySelectorAll?.(selector) || [];
 
   // ── Метод 1: Потвърдени реални hidden input id-та от диагностика ──
   function fromHiddenInputs() {
@@ -29,7 +20,6 @@
       hdnYearMakeModelSeries: 'fullTitle',
       hdnRequestedItemID: 'itemId',
       hdnImageHostURL: 'imageHost',
-      hdnStockNo2_64593001: 'stockNoAlt', // динамичен суфикс, проверяваме отделно по prefix
     };
     for (const [id, key] of Object.entries(ids)) {
       const el = document.getElementById(id);
@@ -38,7 +28,7 @@
     // hdnStockNo2_* има динамичен суфикс с lot ID – намери го по prefix match
     if (!map.stockNoAlt) {
       const el = [...document.querySelectorAll('input[type=hidden]')]
-        .find(i => i.id?.startsWith('hdnStockNo2_'));
+        .find(i => i.id === 'hdnStockNo2_' + (map.itemId || AutoImportVehicle.route(location.href)?.id));
       if (el?.value?.trim()) map.stockNoAlt = el.value.trim();
     }
     console.log('[AI] IAAI hidden inputs:', map);
@@ -48,7 +38,7 @@
   // ── Метод 2: "VEHICLE INFORMATION" блок – label:value двойки по ред ──
   function fromVehicleInfoBlock() {
     const map = {};
-    const header = [...document.querySelectorAll('*')].find(el =>
+    const header = [...nodes('*')].find(el =>
       el.children.length === 0 && el.innerText?.trim() === 'VEHICLE INFORMATION'
     );
     if (!header) return map;
@@ -69,7 +59,7 @@
   // ── Метод 3: "VEHICLE DESCRIPTION" блок – съдържа Engine/Trans/Drivetrain/Color/Body ──
   function fromVehicleDescriptionBlock() {
     const map = {};
-    const header = [...document.querySelectorAll('*')].find(el =>
+    const header = [...nodes('*')].find(el =>
       el.children.length === 0 && el.innerText?.trim() === 'VEHICLE DESCRIPTION'
     );
     if (!header) return map;
@@ -90,13 +80,16 @@
 
   // ── Метод 4: Regex scan на целия видим текст (fallback) ──
   function fromText() {
-    const t = document.body.innerText;
-    const g = re => t.match(re)?.[1]?.trim() || '';
+    const t = vehicleText();
+    const g = re => {
+      const values = [...new Set([...t.matchAll(new RegExp(re.source, re.flags + 'g'))].map(m => m[1]?.trim()).filter(Boolean))];
+      return values.length === 1 ? values[0] : '';
+    };
     return {
       odometer:        g(/Odometer[:\s]*\n?([0-9,]+\s*(?:mi|km)[^\n]*)/i),
       primaryDamage:   g(/Primary\s*Damage[:\s]*\n?([^\n]+)/i),
       secondaryDamage: g(/Secondary\s*Damage[:\s]*\n?([^\n]+)/i),
-      engine:          g(/Engine[:\s]*\n?([0-9.]+L[^\n]+)/i),
+      engine:          g(/Engine[:\s]*\n?([^\n]+)/i),
       transmission:    g(/Transmission[:\s]*\n?([^\n]+)/i),
       drivetrain:      g(/Drive(?:train|line)?[:\s]*\n?([^\n]+)/i),
       fuel:            g(/Fuel(?:\s*Type)?[:\s]*\n?([^\n]+)/i),
@@ -116,7 +109,7 @@
   // https://vis.iaai.com/resizer?imageKeys={lotId}~SID~{sid}~S0~I{n}~RW{w}~H{h}~TH0&width=X&height=Y
   // Всяка снимка (I1, I2, ...) се среща в страницата в няколко резолюции –
   // дедуплицираме по номера I{n} и взимаме версията с най-голяма заявена резолюция.
-  function extractImages() {
+  function extractImages(itemId) {
     const byIndex = new Map(); // n -> { url, width }
 
     function processImg(img) {
@@ -134,7 +127,9 @@
         // Не е resizer URL – пропусни (вероятно UI/декоративен елемент)
         return;
       }
-      const keyParam = decodeURIComponent(m[1]);
+      let keyParam;
+      try { keyParam = decodeURIComponent(m[1]); } catch (_) { return; }
+      if (!itemId || keyParam.split('~')[0] !== itemId) return;
       const idxMatch = keyParam.match(/~I(\d+)~/);
       if (!idxMatch) return;
       const idx = parseInt(idxMatch[1]);
@@ -171,7 +166,11 @@
     }
     await sleep(800);
 
+    vehicleRoot = AutoImportVehicle.scope(document);
     const hidden = fromHiddenInputs();
+    const expected = AutoImportVehicle.route(window.location.href)?.id;
+    if (hidden.itemId && hidden.itemId !== expected) throw Error('IAAI показва друг автомобил. Презареди страницата.');
+    const identity = { sourceId: expected, verified: !!hidden.itemId && hidden.itemId === expected };
     const info   = fromVehicleInfoBlock();
     const desc   = fromVehicleDescriptionBlock();
     const text   = fromText();
@@ -186,7 +185,8 @@
 
     // ── Заглавие ──
     const h1 = document.querySelector('h1')?.innerText?.trim() || '';
-    const title = h1 || hidden.fullTitle || '';
+    if (hidden.fullTitle && h1 && /^\d{4}\s/.test(h1) && h1.toLowerCase() !== hidden.fullTitle.toLowerCase()) throw Error('Заглавието и скритите данни на IAAI не съвпадат. Презареди страницата.');
+    const title = hidden.fullTitle || h1 || '';
     const lotUrl = window.location.href;
 
     // ── Stock number ──
@@ -207,9 +207,11 @@
         if (make && rest.toUpperCase().startsWith(make.toUpperCase())) {
           model = rest.slice(make.length).trim();
         } else {
+          const multi = ['LAND ROVER', 'ALFA ROMEO', 'ASTON MARTIN', 'ROLLS-ROYCE', 'MERCEDES-BENZ'].find(value => rest.toUpperCase().startsWith(value + ' '));
+          if (!make && multi) { make = multi; rest = rest.slice(multi.length).trim(); model = rest; }
           const parts = rest.split(' ');
           if (!make) make = parts[0];
-          model = parts.slice(1).join(' ');
+          if (!model) model = parts.slice(1).join(' ');
         }
       }
     }
@@ -226,10 +228,10 @@
     const engineStr = desc['engine'] || text.engine || '';
     const litM = engineStr.match(/(\d+\.?\d*)\s*[Ll]/);
     const displacement = litM ? String(Math.round(parseFloat(litM[1]) * 1000)) : '';
-    const horsepower = engineStr.match(/(\d+)\s*(?:hp|HP)/)?.[1] || '';
+    const horsepower = engineStr.match(/(\d+(?:\.\d+)?\s*(?:hp|kw|ps))\b/i)?.[1] || '';
 
     // ── Гориво ──
-    const fuelSrc = desc['fuel'] || desc['fuel type'] || text.fuel || engineStr || '';
+    const fuelSrc = desc['fuel'] || desc['fuel type'] || text.fuel || '';
     const fuelRaw = fuelSrc.toLowerCase();
     const fuel = fuelRaw.includes('hybrid') ? 'Хибриден'
                : fuelRaw.includes('diesel') ? 'Дизел'
@@ -280,14 +282,16 @@
     const condition        = info['start code'] || text.condition || '';
     const location          = info['selling branch'] || text.location || '';
 
-    const images = extractImages();
+    const images = extractImages(hidden.itemId || expected);
 
     // ── Серия/Модификация (от VEHICLE DESCRIPTION: Series поле) ──
     const series = desc['series'] || desc['trim'] || desc['trim level'] || '';
 
     console.log('[AI] IAAI scraped:', { title, year, make, model, series, vin, odomKm, engineStr, fuel, transmission, drive, bodyType, colorBg, primaryDamage, images: images.length });
 
-    return {
+    return AutoImportVehicle.normalize({
+      identity,
+      raw: { color: desc['color'] || desc['exterior/interior'] || text.color || '', year, make, model, vin: info['vin (status)'] || text.vin || '', engine: engineStr, power: horsepower, fuel: fuelSrc, transmission: desc['transmission'] || text.transmission || '', drive: desc['drive line type'] || desc['drivetrain'] || desc['drive line'] || text.drivetrain || '', bodyType: desc['body style'] || text.bodyStyle || '', odometer: odomRaw, odometerUnit: '', sourceFields: { hidden, info, desc, text } },
       source: 'iaai',
       lotNumber: stockNum, stockNumber: stockNum, lotUrl, title,
       year, make, model, vin,
@@ -303,7 +307,7 @@
       productionMonth: '',
       images,
       scrapedAt: new Date().toISOString()
-    };
+    });
   }
 
   chrome.runtime.onMessage.addListener((msg, _, sendResponse) => {

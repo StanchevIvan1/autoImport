@@ -3,6 +3,34 @@ const assert = require('node:assert/strict');
 const { extension, car, filler, form, settle } = require('./extension.cjs');
 const { run, element, select } = require('./harness.cjs');
 
+test('image page automatically assigns the first 17 capture images without a review flag or click', async () => {
+  const e = extension();
+  const urls = Array.from({ length: 20 }, (_, i) => `https://cs.copart.com/a-${i}.jpg`);
+  const a = await e.capture(1, car('12345', { images: urls }));
+  const job = await e.start(a); const sender = e.fromTab(job.destinationTabId);
+  await e.send({ action: 'CLAIM_TRANSFER', transferId: job.id }, sender);
+  await e.send({ action: 'FORM_FILLED', transferId: job.id }, sender);
+  const page = form(); page.document.fileInput = element(); page.document.fileInput.files = [];
+  for (const id of ['__ai_s2_close', '__ai_s2_upload', '__ai_s2_dl', '__ai_s2_status']) page.ids.set(id, element());
+  const original = e.send; const fetched = [];
+  e.send = async (message, origin) => {
+    if (message.action !== 'FETCH_IMAGE_AS_BASE64') return original(message, origin);
+    await e.api.authorizeImage(message, origin);
+    fetched.push(message.url);
+    return { success: true, dataUrl: 'data:image/jpeg;base64,aQ==', mimeType: 'image/jpeg' };
+  };
+  filler(e, job, page, {
+    fetch: async () => ({ blob: async () => new Blob(['image'], { type: 'image/jpeg' }) }),
+    DataTransfer: class { constructor() { this.files = []; this.items = { add: file => this.files.push(file) }; } }
+  });
+  await settle();
+  assert.equal(page.document.fileInput.files.length, 17);
+  assert.deepEqual(fetched, urls.slice(0, 17));
+  assert.equal(e.store.values.importState.transfers[job.destinationTabId].data.images.length, 20);
+  assert.equal(e.store.values.importState.transfers[job.destinationTabId].phase, 'imagesAssigned');
+  assert.match(page.ids.get('__ai_s2_status').textContent, /първите 17/);
+});
+
 test('complete form path keeps working selectors and applies requested month and equipment defaults while preserving Euro and condition', async () => {
   const e = extension(); const a = await e.capture(1, car('12345', { odometerKm: 0, fuel: 'Бензин', transmission: 'Автоматична', bodyType: 'SUV', displacement: '3000', primaryDamage: 'FRONT END', vin: 'WBA12345678901234' }));
   const job = await e.start(a, { horsepower: '250', phone: '0881234567', city: 'София', descTemplate: '{мощност} {щета} {пробег}' });
@@ -12,7 +40,7 @@ test('complete form path keeps working selectors and applies requested month and
   assert.equal(f.fields.f16.value, '0'); assert.equal(f.fields.f30.value, '3000'); assert.equal(f.fields.f22.value, '0881234567');
   assert.notEqual(f.fields.f14.value, ''); assert.equal(f.fields.f29.value, ''); assert.equal(f.fields.f25.value, '');
   assert.equal(f.boxes.find(box => box.value === 'Аларма').checked, true); assert.match(f.fields.f21.value, /250 к.с. FRONT END 0 км/);
-  assert.equal(e.store.values.importState.transfers[job.destinationTabId].phase, 'images');
+  assert.equal(e.store.values.importState.transfers[job.destinationTabId].phase, 'completed');
 });
 test('a populated destination is rejected before any vehicle field is overwritten', async () => {
   const e = extension(); const a = await e.capture(1); const job = await e.start(a); const page = form(); page.fields.f5.value = 'Toyota';
@@ -31,7 +59,7 @@ test('region reload resumes only its own tab; reinjection does not consume the s
   await settle(); run('content_scripts/mobile_filler.js', reloaded.ctx); await settle();
   assert.equal(reloaded.onMessage.listeners.length, 1);
   assert.equal(first.fields.f22.value, '123');
-  assert.equal(e.store.values.importState.transfers[job.destinationTabId].phase, 'images');
+  assert.equal(e.store.values.importState.transfers[job.destinationTabId].phase, 'completed');
 });
 test('unknown city and ambiguous model are not replaced with first matching choices', async () => {
   const e = extension(); const a = await e.capture(1); const job = await e.start(a, { city: 'Missing City' });
@@ -70,7 +98,7 @@ test('clearing during an image fetch prevents late assignment and leaves no pend
 });
 
 test('editing vehicle identity after fill invalidates automatic images while preserving user edits', async () => {
-  const e = extension(); const a = await e.capture(1); const job = await e.start(a); const f = filler(e, job);
+  const e = extension(); const a = await e.capture(1, car('12345', { images: ['https://cs.copart.com/a.jpg'] })); const job = await e.start(a); const f = filler(e, job);
   await settle(); await f.message({ action: 'START_FILL', transferId: job.id }); await settle();
   f.fields.f6.value = 'CAMRY';
   for (const listener of f.document.listeners.change) listener();

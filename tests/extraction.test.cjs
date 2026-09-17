@@ -35,10 +35,10 @@ test('scraper propagates failed save instead of reporting false extraction succe
   assert.equal(response.success, false); assert.equal(response.error, 'Cancelled capture');
 });
 
-test('Copart numeric JSON mileage can use matching visible units; kW is never labeled horsepower', async () => {
+test('Copart numeric JSON mileage can use matching visible units; explicit kW is converted to horsepower', async () => {
   const nd = { lot: { ln: 12345, lcy: 2020, mkn: 'BMW', mdn: 'X5', od: 10000 } };
   const data = await load('copart', { nd, text: 'Odometer: 10,000 mi\nHorsepower: 150 kw' }).testHooks.scrape();
-  assert.equal(data.odometerKm, 16093); assert.equal(data.horsepower, '');
+  assert.equal(data.odometerKm, 16093); assert.equal(data.horsepower, '204'); assert.equal(data.raw.power, '150 kw');
   const other = await load('copart', { nd, text: 'Odometer: 20,000 mi' }).testHooks.scrape();
   assert.equal(other.odometerKm, null);
   nd.lot.od = 0; nd.lot.odometerUnit = 'mi';

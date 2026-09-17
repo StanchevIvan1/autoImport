@@ -6,19 +6,10 @@
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  function milesToKm(value, unit = '') {
-    const raw = String(value).trim();
-    // Unknown/not-actual readings are not a verified distance. Preserve zero.
-    if (/unknown|not actual|exempt|inoperable|not available/i.test(raw)) return null;
-    const match = raw.match(/^([0-9][0-9, ]*)(?:\s*(mi(?:les)?|km|kilomet(?:er|re)s?))?(?:\s|$)/i);
-    if (!match) return null;
-    const number = Number(match[1].replace(/[, ]/g, ''));
-    const units = (match[2] || unit).toLowerCase().trim();
-    if (!Number.isFinite(number)) return null;
-    if (/^(km|kilomet(?:er|re)s?)$/.test(units)) return number;
-    if (/^(mi|miles?)$/.test(units)) return Math.round(number * 1.60934);
-    return null;
-  }
+  const milesToKm = AutoImportVehicle.mileage;
+  let vehicleRoot;
+  const vehicleText = () => vehicleRoot?.innerText || vehicleRoot?.textContent || '';
+  const nodes = selector => vehicleRoot?.querySelectorAll?.(selector) || [];
 
   // ── От __NEXT_DATA__ (Next.js JSON) ──
   function fromNextData() {
@@ -26,24 +17,29 @@
     if (!el) return null;
     try {
       const root = JSON.parse(el.textContent);
+      const candidates = [];
       function search(obj, depth) {
-        if (!obj || typeof obj !== 'object' || depth > 12) return null;
-        const expected = location.pathname?.match(/\/lot\/(\d+)/i)?.[1] || location.href.match(/\/lot\/(\d+)/i)?.[1];
-        const number = String(obj.lotNumberStr || obj.ln || '');
-        if (number && number === expected) return obj;
-        for (const v of Object.values(obj)) { const r = search(v, depth+1); if (r) return r; }
-        return null;
+        if (!obj || typeof obj !== 'object' || depth > 12) return;
+        const expected = AutoImportVehicle.route(window.location.href)?.id;
+        const number = String(obj.lotNumberStr || obj.ln || obj.lotNumber || '');
+        if (number && number === expected) candidates.push(obj);
+        for (const v of Object.values(obj)) search(v, depth + 1);
       }
-      const lot = search(root, 0);
+      search(root, 0);
+      for (const keys of [['lcy','year','yr'],['mkn','make','mk'],['mdn','model','md']]) {
+        const values = new Set(candidates.map(obj => keys.map(key => obj[key]).find(value => value != null && String(value).trim())).filter(value => value != null).map(value => String(value).trim().toLowerCase()));
+        if (values.size > 1) throw Error('CONFLICT: Противоречиви данни за текущия lot. Презареди страницата.');
+      }
+      const lot = candidates.sort((a, b) => Object.keys(b).length - Object.keys(a).length)[0];
       if (lot) { console.log('[AI] Next.js keys:', Object.keys(lot).slice(0,30).join(', ')); return lot; }
-    } catch(e) { console.warn('[AI] Next.js parse:', e.message); }
+    } catch(e) { if (e.message.startsWith('CONFLICT:')) throw e; console.warn('[AI] Next.js parse:', e.message); }
     return null;
   }
 
   // ── Label/Value pairs от DOM ──
   function harvestPairs() {
     const map = {};
-    document.querySelectorAll('tr').forEach(tr => {
+    nodes('tr').forEach(tr => {
       const tds = [...tr.querySelectorAll('td,th')];
       for (let i=0; i<tds.length-1; i++) {
         const k=tds[i].innerText.trim().replace(/:$/,'').toLowerCase();
@@ -51,7 +47,7 @@
         if(k&&v&&k.length<50){map[k]=v;i++;}
       }
     });
-    document.querySelectorAll('div,li').forEach(p=>{
+    nodes('div,li').forEach(p=>{
       const ch=[...p.children].filter(c=>c.innerText?.trim());
       if(ch.length===2){
         const k=ch[0].innerText.trim().replace(/:$/,'').toLowerCase();
@@ -59,7 +55,7 @@
         if(k&&v&&k.length<50&&!k.includes('\n'))map[k]=v;
       }
     });
-    document.querySelectorAll('dl').forEach(dl=>{
+    nodes('dl').forEach(dl=>{
       const dts=dl.querySelectorAll('dt'),dds=dl.querySelectorAll('dd');
       dts.forEach((dt,i)=>{if(dds[i])map[dt.innerText.trim().toLowerCase()]=dds[i].innerText.trim();});
     });
@@ -68,8 +64,11 @@
 
   // ── Regex scan на целия текст ──
   function fromText() {
-    const t = document.body.innerText;
-    const g = re => t.match(re)?.[1]?.trim() || '';
+    const t = vehicleText();
+    const g = re => {
+      const values = [...new Set([...t.matchAll(new RegExp(re.source, re.flags + 'g'))].map(m => m[1]?.trim()).filter(Boolean))];
+      return values.length === 1 ? values[0] : '';
+    };
     return {
       odometer:        g(/Odometer[:\s]+([0-9,]+\s*(?:mi|km)[^\n]*)/i),
       primaryDamage:   g(/Primary\s*Damage[:\s]+([^\n]+)/i),
@@ -98,11 +97,11 @@
   }
 
   // ── Снимки ──
-  function extractImages() {
+  function extractImages(lot) {
     const set = new Set();
     // От __NEXT_DATA__
     try {
-      const nd = document.getElementById('__NEXT_DATA__');
+      const nd = lot ? { textContent: JSON.stringify(lot) } : null;
       if (nd) {
         const re = /https?:\\?\/\\?\/[^\s"'\\]+\.(?:jpg|jpeg|png|webp)/gi;
         let m;
@@ -114,20 +113,11 @@
       }
     } catch(e) {}
     // От img тагове
-    document.querySelectorAll('img[src],img[data-src]').forEach(img => {
+    nodes('img[src],img[data-src]').forEach(img => {
       const src = img.getAttribute('data-src') || img.src || '';
       if (!src.match(/\.(jpg|jpeg|png|webp)/i) || !src.startsWith('http')) return;
       const full = src.replace(/_thb\./i,'_ful.').replace(/_thumb\./i,'_full.').replace(/tn_/i,'');
       set.add(full);
-    });
-    // От inline scripts
-    document.querySelectorAll('script:not([src])').forEach(s => {
-      const re = /https?:\/\/[^\s"']+\.(?:jpg|jpeg|png|webp)/gi;
-      let m;
-      while ((m = re.exec(s.textContent)) !== null) {
-        const url = m[0].replace(/\\u002F/g,'/').replace(/\\/g,'');
-        if (url.includes('copart') || url.includes('auction')) set.add(url);
-      }
     });
     return [...set].filter(u => u.startsWith('http')).slice(0, 40);
   }
@@ -135,24 +125,30 @@
   // ── Парсирай данни ──
   function parse(nd, pairs, text) {
     function g(...keys) {
-      for (const k of keys) {
-        const v = [nd?.[k], pairs[k.toLowerCase()], text[k]].find(value => value != null && String(value).trim() !== '');
-        if (v != null) return String(v).trim();
+      for (const source of [nd || {}, pairs, text]) {
+        for (const k of keys) {
+          const v = source[k] ?? source[k.toLowerCase()];
+          if (v != null && String(v).trim() !== '') return String(v).trim();
+        }
       }
       return '';
     }
 
     const h1 = document.querySelector('h1')?.innerText?.trim() || '';
-    const title = h1 || g('lotDescription','ld','title');
+    const title = g('lotDescription','ld','title') || h1;
 
+    if (nd && h1 && /^\d{4}\s/.test(h1)) {
+      const prefix = [g('lcy','year','yr'), g('mkn','make','mk'), g('mdn','model','md')].filter(Boolean).join(' ').toLowerCase();
+      if (prefix && !h1.toLowerCase().startsWith(prefix)) throw Error('Заглавието и данните са за различни автомобили. Презареди страницата.');
+    }
     let year = g('lcy','year','yr') || '';
     let make = g('mkn','make','mk') || '';
     let model = g('mdn','model','md') || '';
 
-    if (!year && title) {
+    if ((!year || !make || !model) && title) {
       const m = title.match(/^(\d{4})\s+(.+)$/);
       if (m) {
-        year = m[1];
+        year = year || m[1];
         const mm = m[2];
         const twoWord = ['ROLLS-ROYCE','LAND ROVER','ASTON MARTIN','ALFA ROMEO','MERCEDES-BENZ','GREAT WALL'];
         let found = false;
@@ -171,7 +167,7 @@
     if (!vin) {
       const vinEl = document.querySelector('[class*="vin" i],[data-cy*="vin" i]');
       vin = vinEl?.innerText?.replace(/[^A-HJ-NPR-Z0-9*]/gi,'') || '';
-      const vinFull = document.body.innerText.match(/VIN[:\s#]+([A-HJ-NPR-Z0-9]{17})/i)?.[1] || '';
+      const vinFull = vehicleText().match(/VIN[:\s#]+([A-HJ-NPR-Z0-9]{17})/i)?.[1] || '';
       if (vinFull) vin = vinFull;
     }
 
@@ -179,11 +175,11 @@
     const lotUrl = window.location.href;
     const lotNumber = lotUrl.match(/lot[\/\-](\d+)/i)?.[1]
       || g('lotNumberStr','ln','lotNumber')
-      || document.body.innerText.match(/Lot\s*(?:number|#|num)[:\s]+(\d+)/i)?.[1] || '';
+      || vehicleText().match(/Lot\s*(?:number|#|num)[:\s]+(\d+)/i)?.[1] || '';
 
     // Одометър
     const odomRaw = g('od','odometer','mileage') || text.odometer || '';
-    let odomKm = milesToKm(odomRaw, g('odometerUnit','odometerUnits','odometerUom'));
+    let odomKm = milesToKm(odomRaw, g('odometerUnit','odometerUnits','odometerUom','odometer unit','odometer units'));
     const visibleOdometer = pairs['odometer'] || text.odometer || '';
     if (odomKm == null && /^[0-9, ]+$/.test(odomRaw) &&
         Number(odomRaw.replace(/[, ]/g, '')) === Number(visibleOdometer.match(/^[0-9, ]+/)?.[0].replace(/[, ]/g, ''))) {
@@ -269,13 +265,19 @@
     let series = g('series','trim','trimLevel') || '';
     if (!series && title && make && model) {
       // Извлечи частта след "ГОДИНА МАРКА МОДЕЛ" от заглавието
-      const titleRest = title.replace(/^\d{4}\s+/,'').replace(new RegExp('^'+make+'\\s+','i'),'').replace(new RegExp('^'+model+'\\s*','i'),'').trim();
+      const titleRest = title.replace(/^\d{4}\s+/,'').replace(new RegExp('^'+make.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')+'\\s+','i'),'').replace(new RegExp('^'+model.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')+'\\s*','i'),'').trim();
       if (titleRest && titleRest.length > 1) series = titleRest;
     }
 
-    const images = extractImages();
+    const expected = AutoImportVehicle.route(lotUrl)?.id;
+    const visibleLot = vehicleText().match(/Lot\s*(?:number|#|num)[:\s]+(\d+)/i)?.[1];
+    if (visibleLot && visibleLot !== expected) throw Error('Номерът на видимата обява не съвпада с адреса. Презареди страницата.');
+    const identity = { sourceId: expected, verified: !!nd || visibleLot === expected };
+    const images = extractImages(nd);
 
-    return {
+    return AutoImportVehicle.normalize({
+      identity,
+      raw: { color: g('clr','color','colour') || text.color || '', year, make, model, vin, engine: engineStr, power: hpRaw, fuel: g('ft','fuel','fuelType') || text.fuel || '', transmission: g('tsmn','transmission'), drive: g('drv','drivetrain','drive'), bodyType: g('bst','bodyStyle','body style','body'), odometer: odomRaw, odometerUnit: g('odometerUnit','odometerUnits','odometerUom','odometer unit','odometer units') || (odomKm != null ? visibleOdometer.match(/\b(mi(?:les)?|km)\b/i)?.[1] || '' : ''), sourceFields: { structured: nd, pairs, text } },
       source:'copart', lotNumber, lotUrl, title,
       year, make, model, vin,
       odometerRaw: odomRaw,
@@ -291,7 +293,7 @@
       productionMonth: text.productionMonth || '',
       images,
       scrapedAt: new Date().toISOString()
-    };
+    });
   }
 
   async function scrape() {
@@ -300,6 +302,7 @@
       if (document.querySelector('h1')?.innerText?.trim()) break;
     }
     await sleep(500);
+    vehicleRoot = AutoImportVehicle.scope(document);
     const nd    = fromNextData();
     const pairs = harvestPairs();
     const text  = fromText();

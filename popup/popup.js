@@ -4,6 +4,65 @@ document.addEventListener('DOMContentLoaded', async () => {
   let displayedCaptureId = null;
   let refreshData = null;
   let fillBusy = false;
+  let pendingCorrections = Promise.resolve();
+  let correctionError = null;
+  const correctionErrors = {};
+  const correctionVersions = {};
+  function saveCorrection(field, value) {
+    const captureId = displayedCaptureId;
+    const version = correctionVersions[field] = (correctionVersions[field] || 0) + 1;
+    const status = document.getElementById('correction-status');
+    status.textContent = 'Записване…';
+    // Send immediately: closing the popup must not cancel a debounce timer.
+    const saving = request({ action: 'SAVE_OVERRIDES', captureId, field, value });
+    pendingCorrections = saving.then(() => {
+      if (captureId !== displayedCaptureId || version !== correctionVersions[field]) return;
+      delete correctionErrors[field];
+      correctionError = Object.values(correctionErrors)[0] || null;
+      status.textContent = correctionError ? 'Не е запазено: ' + correctionError.message : '✓ Запазено за тази обява';
+    }, error => {
+      if (captureId !== displayedCaptureId || version !== correctionVersions[field]) return;
+      correctionErrors[field] = error;
+      correctionError = error;
+      status.textContent = 'Не е запазено: ' + error.message;
+    });
+    return pendingCorrections;
+  }
+  for (const [id, field] of [['d-horsepower', 'horsepower'], ['d-modification', 'modification']]) {
+    document.getElementById(id).addEventListener('input', () => saveCorrection(field, document.getElementById(id).value));
+  }
+
+  async function refreshTransfers() {
+    const { transfers } = await request({ action: 'LIST_TRANSFERS' });
+    const list = document.getElementById('transfer-list');
+    list.innerHTML = '';
+    const labels = { created: 'Изчаква формата / вход в mobile.bg', filling: 'Попълване', phase2: 'Изчаква презареждане', resuming: 'Довършване', images: 'Изчаква стъпката за снимки', imagesAssigned: 'Снимките са предадени — провери качването', completed: 'Данните са попълнени (без снимки)', failed: 'Нужен е повторен опит', cancelled: 'Отменено', detached: 'Прекъснато', expired: 'Изтекло' };
+    if (!transfers.length) {
+      const empty = document.createElement('p'); empty.className = 'transfer-empty';
+      empty.textContent = 'Все още няма започнати прехвърляния.'; list.appendChild(empty);
+    }
+    for (const job of [...transfers].sort((a, b) => b.createdAt - a.createdAt)) {
+      const row = document.createElement('div'); row.className = 'transfer-card';
+      const text = document.createElement('p');
+      text.textContent = `${job.data.year} ${job.data.make} ${job.data.model} · ${labels[job.phase] || job.phase}${job.error ? ': ' + job.error : ''}${job.result ? ` · Снимки: ${job.result.imagesAssigned}/${job.result.imagesExpected}${job.result.warnings?.length ? ' · Провери: ' + job.result.warnings.join('; ') : ''}` : ''}`;
+      row.appendChild(text);
+      for (const [label, action] of [['Повторен опит в нова форма', 'RETRY_TRANSFER'], ['Откажи', 'CANCEL_JOB']]) {
+        const button = document.createElement('button'); button.textContent = label;
+        button.className = action === 'CANCEL_JOB' ? 'btn btn-danger' : 'btn btn-secondary';
+        button.onclick = async () => {
+          button.disabled = true;
+          try { await request({ action, transferId: job.id }); await refreshTransfers(); }
+          catch (error) { text.textContent = error.message; button.disabled = false; }
+        };
+        row.appendChild(button);
+      }
+      list.appendChild(row);
+    }
+  }
+  await refreshTransfers();
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.importState) refreshTransfers().catch(console.error);
+  });
 
   // ── Tabs ──
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
@@ -62,8 +121,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
     const url = activeTab?.url || '';
     const page = new URL(url || 'https://invalid.local');
-    const isCopart = page.protocol === 'https:' && /(^|\.)copart\.com$/.test(page.hostname) && /^\/lot\/\d+/i.test(page.pathname);
-    const isIAAI = page.protocol === 'https:' && /(^|\.)iaai\.com$/.test(page.hostname) && /^\/(VehicleDetail|vehicles|vehicle|buy)\/.+/i.test(page.pathname);
+    const sourceRoute = AutoImportVehicle.route(url);
+    const isCopart = sourceRoute?.source === 'copart';
+    const isIAAI = sourceRoute?.source === 'iaai';
     const isMobile = page.protocol === 'https:' && ['mobile.bg', 'www.mobile.bg'].includes(page.hostname);
     const isAuction = isCopart || isIAAI;
 
@@ -116,7 +176,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         let alive = false;
         try { alive = !!(await chrome.tabs.sendMessage(activeTab.id, { action: 'PING' }))?.active; } catch(_) {}
         if (!alive) {
-          await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: [file] });
+          await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['shared/vehicle.js', file] });
           await pause(800);
         }
         const r = await chrome.tabs.sendMessage(activeTab.id, { action: 'SCRAPE_NOW', requestId: ticket.requestId });
@@ -156,7 +216,10 @@ document.addEventListener('DOMContentLoaded', async () => {
           await refreshData();
           throw Error('Данните са сменени. Провери показаната обява и опитай отново.');
         }
+        await pendingCorrections;
+        if (correctionError) throw correctionError;
         const settings = await getSettings();
+        if (settings.horsepower && (!/^\d+$/.test(settings.horsepower) || Number(settings.horsepower) <= 0 || Number(settings.horsepower) > 10000)) throw Error('Въведи валидни конски сили или остави празно.');
         const result = await request({ action: 'START_TRANSFER', captureId: expectedId, settings,
           ...(isMobile && page.pathname === '/pcgi/mobile.cgi' && page.searchParams.get('pubtype') === '1' ? { tabId: activeTab.id } : {}) });
         if (result.transfer.phase === 'failed') throw Error(result.transfer.error);
@@ -311,6 +374,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function resetPreview() {
     displayedCaptureId = null;
+    correctionError = null;
+    for (const key of Object.keys(correctionErrors)) delete correctionErrors[key];
     dot('data', '', 'Няма запазени данни за тази обява');
     document.getElementById('btn-fill').disabled = true;
     document.getElementById('no-data-msg')?.classList.remove('hidden');
@@ -349,8 +414,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   function escapeHtml(value) { return String(value).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c])); }
   function renderData(d) {
     if (displayedCaptureId !== d.capture?.id) {
-      document.getElementById('d-horsepower').value = d.horsepower || '';
-      document.getElementById('d-modification').value = d.series || '';
+      document.getElementById('d-horsepower').value = d.overrides?.horsepower || '';
+      document.getElementById('d-horsepower').placeholder = d.horsepower || 'напр. 211';
+      document.getElementById('d-modification').value = d.overrides?.modification || '';
+      document.getElementById('d-modification').placeholder = d.series || 'S-Line, AMG...';
+      correctionError = null;
+      for (const key of Object.keys(correctionErrors)) delete correctionErrors[key];
+      document.getElementById('correction-status').textContent = Object.keys(d.overrides || {}).length ? '✓ Запазено за тази обява' : 'Промените се запазват автоматично';
     }
     displayedCaptureId = d.capture?.id || null;
     document.getElementById('no-data-msg')?.classList.add('hidden');
@@ -359,6 +429,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (badge) badge.textContent = d.source === 'copart' ? '📡 Copart' : '📡 IAAI';
     const titleEl = document.getElementById('car-title');
     if (titleEl) titleEl.textContent = d.title || `${d.year} ${d.make} ${d.model}`.trim() || '–';
+    const review = document.getElementById('vehicle-review');
+    if (review) {
+      const labels = { vin: 'VIN', year: 'Година', make: 'Марка', model: 'Модел', odometerKm: 'Пробег', fuel: 'Гориво', transmission: 'Скорости', drive: 'Задвижване', bodyType: 'Купе', displacement: 'Кубатура', horsepower: 'Мощност' };
+      const keys = { odometerKm: 'odometer', displacement: 'engine', horsepower: 'power' };
+      review.textContent = (d.review || []).map(item => `${labels[item.field] || item.field}: ${d.raw?.[keys[item.field] || item.field] || 'липсва'} — провери ръчно`).join(' · ');
+    }
     const ir = document.getElementById('images-row');
     if (ir) ir.innerHTML = (d.images || []).map(u =>
       `<a href="${escapeHtml(u)}" target="_blank" rel="noopener noreferrer"><img src="${escapeHtml(u)}" class="img-thumb"></a>`).join('');

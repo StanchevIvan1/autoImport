@@ -9,8 +9,7 @@ test('existing empty transfer recovers only its original capture images', async 
   const stored = e.store.values.importState.transfers[job.destinationTabId];
   stored.data.images = []; delete stored.imagePolicy;
   const recovered = (await e.send({ action: 'GET_TRANSFER' }, e.fromTab(job.destinationTabId))).transfer;
-  assert.deepEqual(recovered.data.images, a.images);
-  stored.data.images = []; delete stored.imagePolicy;
+  assert.deepEqual(Array.from(recovered.data.images), Array.from(a.images));
   // Re-read storage reference after the first migration wrote a fresh snapshot.
   const current = e.store.values.importState.transfers[job.destinationTabId];
   current.data.images = []; delete current.imagePolicy;
@@ -93,13 +92,13 @@ test('navigation and browser startup retire tab-owned state without changing aut
   const e = extension({ auth: { token: 'saved' } }); const a = await e.capture(1); const job = await e.start(a);
   const url = 'https://www.mobile.bg/'; e.tabs.get(job.destinationTabId).url = url;
   e.chrome.tabs.onUpdated.listeners[0](job.destinationTabId, { url }); await settle();
-  assert.equal(e.store.values.importState.transfers[job.destinationTabId], undefined);
+  assert.equal(e.store.values.importState.transfers[job.destinationTabId].id, job.id);
   e.chrome.runtime.onStartup.listeners[0](); await settle();
-  assert.equal(e.store.values.importState, undefined); assert.equal(e.store.values.auth.token, 'saved');
+  assert.equal(e.store.values.importState.transfers[job.destinationTabId].phase, 'detached'); assert.equal(e.store.values.auth.token, 'saved');
 });
 
 test('expired destination ownership cannot be used for an image or form update', async () => {
   const e = extension(); const a = await e.capture(1); const job = await e.start(a);
   e.store.values.importState.transfers[job.destinationTabId].createdAt = Date.now() - 3 * 60 * 60 * 1000;
-  await assert.rejects(e.send({ action: 'CHECK_TRANSFER', transferId: job.id }, e.fromTab(job.destinationTabId)), /изчистено/);
+  await assert.rejects(e.send({ action: 'CHECK_TRANSFER', transferId: job.id }, e.fromTab(job.destinationTabId)), /изтекло/);
 });

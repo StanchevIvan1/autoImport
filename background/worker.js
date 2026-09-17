@@ -1,4 +1,4 @@
-importScripts('transfers.js');
+importScripts('../shared/vehicle.js', 'transfers.js');
 
 // worker.js v5.2 – auth синхронизиран с реалния Node.js сървър
 // ══════════════════════════════════════════════════════════
@@ -152,13 +152,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   const transferActions = ['BEGIN_SCRAPE', 'SAVE_CAR_DATA', 'GET_CAR_DATA', 'GET_STATUS',
-    'CLEAR_CAR_DATA', 'START_TRANSFER', 'GET_TRANSFER', 'CHECK_TRANSFER', 'CLAIM_TRANSFER',
-    'SAVE_PHASE2', 'FORM_FILLED', 'IMAGES_ASSIGNED', 'TRANSFER_FAILED'];
+    'CLEAR_CAR_DATA', 'SAVE_OVERRIDES', 'START_TRANSFER', 'GET_TRANSFER', 'CHECK_TRANSFER', 'CLAIM_TRANSFER',
+    'LIST_TRANSFERS', 'CANCEL_JOB', 'RETRY_TRANSFER', 'SAVE_PHASE2', 'FORM_FILLED', 'IMAGES_ASSIGNED', 'TRANSFER_FAILED'];
   if (transferActions.includes(msg.action)) {
     AutoImportTransfers.handle(msg, sender).then(result => {
-      if (msg.action === 'START_TRANSFER' && result.success) {
+      if (['START_TRANSFER', 'RETRY_TRANSFER'].includes(msg.action) && result.success) {
         const job = result.transfer;
-        if (!result.duplicate) dispatchTransfer(job).catch(console.error);
+        if (job.phase === 'created') dispatchTransfer(job).catch(console.error);
         chrome.tabs.update(job.destinationTabId, { active: true }).then(tab =>
           chrome.windows.update(tab.windowId, { focused: true })).catch(console.error);
       }
@@ -193,7 +193,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // The worker owns dispatch before activating a tab can close the popup.
-async function dispatchTransfer(job) {
+const dispatches = new Map();
+function dispatchTransfer(job) {
+  if (dispatches.has(job.id)) return dispatches.get(job.id);
+  const pending = runDispatch(job).finally(() => dispatches.delete(job.id));
+  dispatches.set(job.id, pending);
+  return pending;
+}
+async function runDispatch(job) {
   const tabId = job.destinationTabId;
   const sender = { tab: { id: tabId }, url: 'https://www.mobile.bg/pcgi/mobile.cgi', frameId: 0 };
   try {
@@ -201,17 +208,47 @@ async function dispatchTransfer(job) {
     for (let i = 0; i < 30; i++) {
       await new Promise(resolve => setTimeout(resolve, 500));
       const tab = await chrome.tabs.get(tabId);
-      if (!AutoImportTransfers.mobile(tab.url)) throw Error('Отвори формата след вход в mobile.bg.');
+      if (!AutoImportTransfers.mobile(tab.url)) return; // Wait for the same tab to return after login.
       if (tab.status === 'complete') { loaded = true; break; }
     }
     if (!loaded) throw Error('Формата не се зареди навреме.');
     const check = await AutoImportTransfers.handle({ action: 'CHECK_TRANSFER', transferId: job.id }, sender);
     if (check.transfer.phase !== 'created') return;
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['content_scripts/mobile_filler.js'] });
-    const result = await chrome.tabs.sendMessage(tabId, { action: 'START_FILL', transferId: job.id });
-    if (!result?.success) throw Error(result?.error || 'Попълването не започна.');
+    let result;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const latest = await AutoImportTransfers.handle({ action: 'CHECK_TRANSFER', transferId: job.id }, sender);
+      if (latest.transfer.phase !== 'created') return;
+      const tab = await chrome.tabs.get(tabId);
+      if (!AutoImportTransfers.mobile(tab.url)) return;
+      try {
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['content_scripts/mobile_filler.js'] });
+        result = await chrome.tabs.sendMessage(tabId, { action: 'START_FILL', transferId: job.id });
+        break;
+      } catch (error) {
+        if (attempt === 2) throw error;
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+    if (!result?.success) {
+      const latest = await AutoImportTransfers.handle({ action: 'CHECK_TRANSFER', transferId: job.id }, sender);
+      if (latest.transfer.phase === 'created') throw Error(result?.error || 'Попълването не започна.');
+    }
   } catch (error) {
-    await AutoImportTransfers.handle({ action: 'TRANSFER_FAILED', transferId: job.id, error: error.message }, sender).catch(() => {});
-    console.error('[Worker] Transfer:', error.message);
+    // A lost reply can mean the page already claimed the job or navigated.
+    // Only a still-unclaimed job may be failed by the dispatcher.
+    try {
+      const result = await AutoImportTransfers.handle({ action: 'TRANSFER_FAILED', transferId: job.id, error: error.message, onlyIfCreated: true }, sender);
+      if (result.transfer.phase === 'failed') console.error('[Worker] Transfer ' + job.id + ':', error.message);
+    } catch (_) { /* Closed, cancelled, cleared or redirected: no dispatch failure to record. */ }
   }
 }
+
+// Event-driven dispatch survives worker suspension and login/region navigation.
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (change.status !== 'complete') return;
+  (async () => {
+    const saved = await chrome.storage.local.get('importState');
+    const job = saved.importState?.transfers?.[tabId];
+    if (job?.phase === 'created') await dispatchTransfer(job);
+  })().catch(console.error);
+});

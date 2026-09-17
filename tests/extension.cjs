@@ -45,7 +45,7 @@ async function popup(ext, activeId, scrapeData) {
     if (cb) result.then(cb); else return result;
   } } };
   const ctx = context({ chrome,
-    document: { addEventListener(_, fn) { loaded = fn; }, getElementById: get, querySelectorAll: () => [], querySelector: () => null },
+    document: { createElement: tag => element(tag.toUpperCase()), addEventListener(_, fn) { loaded = fn; }, getElementById: get, querySelectorAll: () => [], querySelector: () => null },
     setTimeout() {}, close() {}
   });
   run('popup/popup.js', ctx);
