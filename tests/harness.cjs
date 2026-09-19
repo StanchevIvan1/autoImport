@@ -26,7 +26,7 @@ function element(tagName = 'INPUT', value = '') {
   };
 }
 function context(extra = {}) {
-  const sandbox = { console: { log() {}, warn() {}, error() {} }, URL, Date, Math, JSON, Map, Set, Promise, AbortSignal, structuredClone, Blob, File, crypto: require('node:crypto').webcrypto,
+  const sandbox = { console: { log() {}, warn() {}, error() {} }, URL, Date, Math, JSON, Map, Set, Promise, AbortSignal, AbortController, Uint8Array, structuredClone, Blob, File, crypto: require('node:crypto').webcrypto,
     setTimeout(fn) { queueMicrotask(fn); return 1; }, clearTimeout() {},
     Event: class { constructor(type) { this.type = type; } },
     ...extra };
@@ -34,7 +34,8 @@ function context(extra = {}) {
   return vm.createContext(sandbox);
 }
 function run(file, ctx, expose = []) {
-  if (file !== 'shared/vehicle.js' && !ctx.AutoImportVehicle) run('shared/vehicle.js', ctx);
+  if (file !== 'shared/images.js' && !ctx.AutoImportImages) run('shared/images.js', ctx);
+  if (file !== 'shared/vehicle.js' && file !== 'shared/images.js' && !ctx.AutoImportVehicle) run('shared/vehicle.js', ctx);
   let source = fs.readFileSync(path.join(root, file), 'utf8');
   if (expose.length) source = source.replace(/\}\)\(\);\s*$/, `globalThis.testHooks = { ${expose.join(',')} };\n})();`);
   vm.runInContext(source, ctx, { filename: file });

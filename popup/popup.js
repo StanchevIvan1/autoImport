@@ -46,6 +46,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       const text = document.createElement('p');
       text.textContent = `${job.data.year} ${job.data.make} ${job.data.model} · ${labels[job.phase] || job.phase}${job.error ? ': ' + job.error : ''}${job.result ? ` · Снимки: ${job.result.imagesAssigned}/${job.result.imagesExpected}${job.result.warnings?.length ? ' · Провери: ' + job.result.warnings.join('; ') : ''}` : ''}`;
       row.appendChild(text);
+      if (job.imageResult) {
+        const detail = document.createElement('p');
+        detail.textContent = `Снимки: ${job.imageResult.uploaded}/${job.imageResult.expected} потвърдени; ${job.imageResult.failed} неуспешни; ${job.imageResult.unconfirmed} непотвърдени; ${job.imageResult.excluded || 0} извън лимита на формата.`;
+        row.appendChild(detail);
+        for (const item of job.imageItems || []) if (item.error) {
+          const error = document.createElement('p'); error.textContent = `Снимка ${item.index + 1}: ${item.error}`; row.appendChild(error);
+        }
+      }
       for (const [label, action] of [['Повторен опит в нова форма', 'RETRY_TRANSFER'], ['Откажи', 'CANCEL_JOB']]) {
         const button = document.createElement('button'); button.textContent = label;
         button.className = action === 'CANCEL_JOB' ? 'btn btn-danger' : 'btn btn-secondary';
@@ -176,7 +184,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         let alive = false;
         try { alive = !!(await chrome.tabs.sendMessage(activeTab.id, { action: 'PING' }))?.active; } catch(_) {}
         if (!alive) {
-          await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['shared/vehicle.js', file] });
+          await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['shared/images.js', 'shared/vehicle.js', file] });
           await pause(800);
         }
         const r = await chrome.tabs.sendMessage(activeTab.id, { action: 'SCRAPE_NOW', requestId: ticket.requestId });

@@ -1,4 +1,4 @@
-importScripts('../shared/vehicle.js', 'transfers.js');
+importScripts('../shared/vehicle.js', '../shared/images.js', 'transfers.js', 'images.js');
 
 // worker.js v5.2 – auth синхронизиран с реалния Node.js сървър
 // ══════════════════════════════════════════════════════════
@@ -153,7 +153,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   const transferActions = ['BEGIN_SCRAPE', 'SAVE_CAR_DATA', 'GET_CAR_DATA', 'GET_STATUS',
     'CLEAR_CAR_DATA', 'SAVE_OVERRIDES', 'START_TRANSFER', 'GET_TRANSFER', 'CHECK_TRANSFER', 'CLAIM_TRANSFER',
-    'LIST_TRANSFERS', 'CANCEL_JOB', 'RETRY_TRANSFER', 'SAVE_PHASE2', 'FORM_FILLED', 'IMAGES_ASSIGNED', 'TRANSFER_FAILED'];
+    'IMAGE_STATE', 'IMAGE_RETRY', 'LIST_TRANSFERS', 'CANCEL_JOB', 'RETRY_TRANSFER', 'SAVE_PHASE2', 'FORM_FILLED', 'IMAGES_ASSIGNED', 'TRANSFER_FAILED'];
   if (transferActions.includes(msg.action)) {
     AutoImportTransfers.handle(msg, sender).then(result => {
       if (['START_TRANSFER', 'RETRY_TRANSFER'].includes(msg.action) && result.success) {
@@ -171,23 +171,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Service worker контекстът има extension host_permissions и не е обвързан
   // от CORS политиката на mobile.bg страницата, за разлика от content script fetch().
   if (msg.action === 'FETCH_IMAGE_AS_BASE64') {
-    (async () => {
-      try {
-        await AutoImportTransfers.authorizeImage(msg, sender);
-        const res = await fetch(msg.url, { signal: AbortSignal.timeout(15000) });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const blob = await res.blob();
-        const reader = new FileReader();
-        const base64 = await new Promise((resolve, reject) => {
-          reader.onloadend = () => resolve(reader.result);
-          reader.onerror = reject;
-          reader.readAsDataURL(blob);
-        });
-        sendResponse({ success: true, dataUrl: base64, mimeType: blob.type || 'image/jpeg' });
-      } catch (e) {
-        sendResponse({ success: false, error: e.message });
-      }
-    })();
+    AutoImportImageFetch.fetchImage(msg, sender).then(sendResponse).catch(error => sendResponse({ success: false, error: error.message, code: error.code || 'fetch-failed' }));
     return true;
   }
 });
@@ -221,7 +205,7 @@ async function runDispatch(job) {
       const tab = await chrome.tabs.get(tabId);
       if (!AutoImportTransfers.mobile(tab.url)) return;
       try {
-        await chrome.scripting.executeScript({ target: { tabId }, files: ['content_scripts/mobile_filler.js'] });
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['shared/images.js', 'content_scripts/mobile_filler.js'] });
         result = await chrome.tabs.sendMessage(tabId, { action: 'START_FILL', transferId: job.id });
         break;
       } catch (error) {

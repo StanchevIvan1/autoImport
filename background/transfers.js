@@ -59,9 +59,7 @@ const AutoImportTransfers = (() => {
       throw Error('Липсват надеждни марка, модел или година. Изчакай обявата и извлечи отново.');
     }
     if (!Array.isArray(data.images)) data.images = [];
-    data.images = [...new Set(data.images.filter(value => {
-      try { const u = new URL(value); return u.protocol === 'https:' && !u.username && !u.password; } catch (_) { return false; }
-    }))];
+    data.images = AutoImportImages.unique(data.images);
   }
   async function handle(msg, sender) {
     return serial(async () => {
@@ -75,6 +73,8 @@ const AutoImportTransfers = (() => {
         const job = Object.values(state.transfers).find(j => j.id === msg.transferId);
         if (!job) throw Error('Прехвърлянето е изчистено.');
         if (msg.action === 'CANCEL_JOB') {
+          for (const item of AutoImportImages.ensure(job)) if (item.state !== 'uploaded') item.state = 'cancelled';
+          job.imageResult = AutoImportImages.summary(job.imageItems);
           job.phase = 'cancelled'; job.error = 'Отменено от потребителя.';
           await write(state);
           await chrome.tabs.sendMessage(job.destinationTabId, { action: 'CANCEL_TRANSFER', transferId: job.id }).catch(() => {});
@@ -86,7 +86,9 @@ const AutoImportTransfers = (() => {
         const retry = { id: crypto.randomUUID(), retryOf: job.id, destinationTabId: tab.id,
           data: structuredClone(job.data), settings: structuredClone(job.settings), imagePolicy: 'automatic-v1',
           phase: 'created', createdAt: Date.now(), n: 0 };
-        job.phase = 'cancelled'; job.error = 'Заменено с повторен опит в нова форма.';
+        for (const item of AutoImportImages.ensure(job)) if (item.state !== 'uploaded') item.state = 'cancelled';
+          job.imageResult = AutoImportImages.summary(job.imageItems);
+          job.phase = 'cancelled'; job.error = 'Заменено с повторен опит в нова форма.';
         if (state.transfers[tab.id]) state.transfers[state.transfers[tab.id].id] = state.transfers[tab.id];
         state.transfers[tab.id] = retry;
         await write(state);
@@ -209,12 +211,41 @@ const AutoImportTransfers = (() => {
               job.data.images = structuredClone(capture.images);
             }
             job.imagePolicy = 'automatic-v1';
-            await write(state);
           }
+          AutoImportImages.ensure(job);
+          job.imageResult = AutoImportImages.summary(job.imageItems);
+          await write(state);
         }
         return { success: true, transfer: job || null };
       }
       const job = await owned(state, sender, msg.transferId);
+      if (['IMAGE_STATE', 'IMAGE_RETRY'].includes(msg.action)) {
+        if (!['images','imagesAssigned'].includes(job.phase)) throw Error('Невалиден етап за снимки.');
+        const items = AutoImportImages.ensure(job);
+        const item = items.find(i => i.url === msg.url);
+        if (!item) throw Error('Снимката не принадлежи на това прехвърляне.');
+        if (msg.action === 'IMAGE_RETRY') {
+          if (item.state !== 'failed') throw Error('Само неуспешни снимки могат да се повторят.');
+          item.state = 'pending'; item.attempts = 0; item.generation = (item.generation || 0) + 1;
+          item.filename = `autoimport_${job.id}_${String(item.index + 1).padStart(2, '0')}_r${item.generation}.jpg`;
+          delete item.error; delete item.code;
+        } else {
+          const allowed = { pending:['fetching','fetched','failed'], fetching:['fetching','fetched','failed'], fetched:['fetching','fetched','uploading','failed'], uploading:['uploaded','unconfirmed','failed'], unconfirmed:['uploaded','failed'], uploaded:[], failed:[] };
+          if (!allowed[item.state]?.includes(msg.state)) throw Error('Снимката вече е предадена или състоянието е невалидно.');
+          if (msg.state === 'fetching') {
+            if (item.attempts >= 3) { item.state = 'failed'; item.code = 'retry-limit'; item.error = 'Лимитът за опити е достигнат. Използвай повторен опит.'; job.imageResult = AutoImportImages.summary(items); await write(state); throw Error(item.error); }
+            item.attempts++;
+          }
+          item.state = msg.state;
+          item.error = String(msg.error || '').slice(0,500); item.code = String(msg.code || '').slice(0,80);
+          if (msg.state === 'uploaded') item.receipt = String(msg.receipt || '').slice(0,200);
+        }
+        item.updatedAt = Date.now();
+        job.imageResult = AutoImportImages.summary(items);
+        job.result = { ...(job.result || {}), uploadConfirmed: job.imageResult.outcome === 'complete', imagesUploaded: job.imageResult.uploaded };
+        await write(state);
+        return { success: true, transfer: job };
+      }
       if (msg.action === 'CHECK_TRANSFER') {
         if (job.phase === 'failed') throw Error(job.error || 'Прехвърлянето е спряно.');
         return { success: true, transfer: job };
@@ -233,7 +264,9 @@ const AutoImportTransfers = (() => {
         if (!['filling', 'resuming'].includes(job.phase)) throw Error('Невалиден етап.');
         delete job.documentId;
         job.phase = job.data.images.length ? 'images' : 'completed';
-        job.result = { formFilled: true, imagesExpected: Math.min(17, job.data.images.length), imagesAssigned: 0, uploadConfirmed: false, warnings: Array.isArray(msg.warnings) ? msg.warnings.map(String) : [] };
+        job.result = { formFilled: true, imagesExpected: job.data.images.length, imagesAssigned: 0, uploadConfirmed: false, warnings: Array.isArray(msg.warnings) ? msg.warnings.map(String) : [] };
+        AutoImportImages.ensure(job);
+        job.imageResult = AutoImportImages.summary(job.imageItems);
         job.formIdentity = msg.formIdentity || job.formIdentity;
       } else if (msg.action === 'IMAGES_ASSIGNED') {
         if (!['images', 'imagesAssigned'].includes(job.phase)) throw Error('Невалиден етап за снимки.');
@@ -251,7 +284,8 @@ const AutoImportTransfers = (() => {
   async function authorizeImage(msg, sender) {
     return serial(async () => {
       const job = await owned(await read(), sender, msg.transferId);
-      if (!['images', 'imagesAssigned'].includes(job.phase) || !job.data.images.includes(msg.url)) throw Error('Снимката не принадлежи на това прехвърляне.');
+      const item = AutoImportImages.ensure(job).find(i => i.url === msg.url);
+      if (!['images', 'imagesAssigned'].includes(job.phase) || !item || !['pending','fetching','fetched'].includes(item.state)) throw Error('Снимката не принадлежи на това прехвърляне.');
     });
   }
   chrome.tabs.onRemoved.addListener(tabId => {

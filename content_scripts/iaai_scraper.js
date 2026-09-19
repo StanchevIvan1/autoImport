@@ -113,8 +113,13 @@
     const byIndex = new Map(); // n -> { url, width }
 
     function processImg(img) {
-      const src = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.src || '';
-      if (!src.startsWith('http')) return;
+      const candidates = [img.getAttribute('data-src'), img.getAttribute('data-lazy-src'), img.currentSrc, img.src];
+      for (const value of candidates) {
+        const src = AutoImportImages.resolveUrl(value, window.location.href);
+        if (src) processSource(img, src);
+      }
+    }
+    function processSource(img, src) {
 
       // Изключи известния видео placeholder и други не-снимкови ресурси
       if (src.includes('thumbnail-engine-video')) return;
@@ -134,8 +139,8 @@
       if (!idxMatch) return;
       const idx = parseInt(idxMatch[1]);
 
-      // Поискай максимална резолюция, независимо каква е била в thumbnail версията
-      const bigUrl = src.replace(/width=\d+&height=\d+/, 'width=2576&height=1932');
+      // Keep the largest available variant without modifying signed parameters.
+      const bigUrl = src; // Preserve signed query parameters byte-for-byte.
 
       const widthMatch = src.match(/width=(\d+)/);
       const w = widthMatch ? parseInt(widthMatch[1]) : 0;
@@ -154,7 +159,7 @@
       .map(([, v]) => v.url);
 
     console.log('[AI] IAAI снимки извлечени (уникални по index):', images.length);
-    return images;
+    return AutoImportImages.unique(images);
   }
 
   // ── Главна функция ──

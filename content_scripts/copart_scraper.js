@@ -98,28 +98,40 @@
 
   // ── Снимки ──
   function extractImages(lot) {
-    const set = new Set();
-    // От __NEXT_DATA__
-    try {
-      const nd = lot ? { textContent: JSON.stringify(lot) } : null;
-      if (nd) {
-        const re = /https?:\\?\/\\?\/[^\s"'\\]+\.(?:jpg|jpeg|png|webp)/gi;
-        let m;
-        while ((m = re.exec(nd.textContent)) !== null) {
-          const url = m[0].replace(/\\u002F/g,'/').replace(/\\/g,'');
-          const full = url.replace(/_thb\./i,'_ful.').replace(/_thumb\./i,'_full.').replace(/\/thb\//i,'/ful/').replace(/\/thumb\//i,'/full/').replace(/tn_/i,'');
-          if (full.startsWith('http')) set.add(full);
-        }
+    const urls = [];
+    const expected = AutoImportVehicle.route(window.location.href)?.id;
+    const resolve = value => AutoImportImages.resolveUrl(value, window.location.href);
+    function collect(value, imageBranch = false, depth = 0) {
+      if (depth > 10 || urls.length >= 100) return;
+      if (typeof value === 'string') { const url = imageBranch && resolve(value); if (url) urls.push(url); return; }
+      if (!value || typeof value !== 'object') return;
+      if (Array.isArray(value)) { value.forEach(item => collect(item, imageBranch, depth + 1)); return; }
+      const owner = String(value.lotNumberStr || value.ln || value.lotNumber || '');
+      if (owner && owner !== expected) return;
+      for (const [key, item] of Object.entries(value)) {
+        if (/recommend|related|similar|advert|logo|icon/i.test(key)) continue;
+        collect(item, imageBranch || /image|photo|gallery|^imgs?$|^imgList$|^[ft]url$/i.test(key), depth + 1);
       }
-    } catch(e) {}
-    // От img тагове
-    nodes('img[src],img[data-src]').forEach(img => {
-      const src = img.getAttribute('data-src') || img.src || '';
-      if (!src.match(/\.(jpg|jpeg|png|webp)/i) || !src.startsWith('http')) return;
-      const full = src.replace(/_thb\./i,'_ful.').replace(/_thumb\./i,'_full.').replace(/tn_/i,'');
-      set.add(full);
+    }
+    collect(lot);
+    // Gallery markup varies between layouts. Merge its images even when JSON
+    // provides only the lead photo. Never search unscoped page images.
+    const galleries = ['[class*="gallery" i]', '[id*="gallery" i]', '[class*="carousel" i]',
+      '[class*="lot-image" i]', '[id*="lot-image" i]', '[class*="lotImages" i]',
+      '.image-container', '.p-galleria', '.galleria', '.slick-slider'];
+    nodes(galleries.map(selector => `${selector} img`).join(',')).forEach(img => {
+      for (let parent = img; parent; parent = parent.parentElement) {
+        if (/recommend|related|similar|advert|logo|icon/i.test(`${parent.id || ''} ${parent.className || ''}`)) return;
+        const owner = parent.getAttribute?.('data-lot-number') || parent.getAttribute?.('data-lot');
+        if (owner && String(owner) !== expected) return;
+        const linked = AutoImportVehicle.route(resolve(parent.getAttribute?.('href')));
+        if (linked && linked.id !== expected) return;
+      }
+      const url = [img.getAttribute('data-src'), img.getAttribute('data-lazy-src'),
+        img.getAttribute('data-lazy'), img.currentSrc, img.src].map(resolve).find(Boolean);
+      if (url) urls.push(url);
     });
-    return [...set].filter(u => u.startsWith('http')).slice(0, 40);
+    return AutoImportImages.unique(urls);
   }
 
   // ── Парсирай данни ──

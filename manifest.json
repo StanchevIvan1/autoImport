@@ -28,6 +28,7 @@
         "https://*.copart.com/lot/*"
       ],
       "js": [
+        "shared/images.js",
         "shared/vehicle.js",
         "content_scripts/copart_scraper.js"
       ],
@@ -41,6 +42,7 @@
         "https://*.iaai.com/buy/*"
       ],
       "js": [
+        "shared/images.js",
         "shared/vehicle.js",
         "content_scripts/iaai_scraper.js"
       ],
@@ -52,6 +54,7 @@
         "https://www.mobile.bg/*"
       ],
       "js": [
+        "shared/images.js",
         "content_scripts/mobile_filler.js"
       ],
       "run_at": "document_idle"

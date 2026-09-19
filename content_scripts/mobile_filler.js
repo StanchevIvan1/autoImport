@@ -404,31 +404,75 @@
   }
 
   // Автоматично инжектирай снимките в <input type="file"> чрез DataTransfer API
+  // A file selection or local thumbnail is never an upload receipt. This adapter
+  // recognizes only a matching Dropzone filename with its terminal server status.
+  async function reconcileImages(wait = false) {
+    for (let poll = 0; poll < (wait ? 60 : 1); poll++) {
+      await assertOwned();
+      const items = currentJob.imageItems || [];
+      let pending = false;
+      for (const item of items.filter(i => ['uploading','unconfirmed'].includes(i.state))) {
+        const rows = [...document.querySelectorAll('.dz-preview')].filter(row => row.querySelector('[data-dz-name]')?.textContent?.trim() === item.filename);
+        const row = rows.length === 1 ? rows[0] : null;
+        if (row?.classList.contains('dz-error')) {
+          currentJob = (await call('IMAGE_STATE', { url: item.url, state: 'failed', code: 'destination-rejected', error: row.querySelector('[data-dz-errormessage]')?.textContent || 'Сайтът отхвърли снимката.' })).transfer;
+        } else if (row?.classList.contains('dz-success')) {
+          currentJob = (await call('IMAGE_STATE', { url: item.url, state: 'uploaded', receipt: 'dropzone-success:' + item.filename })).transfer;
+        } else pending = true;
+      }
+      if (!pending) return;
+      // Unknown uploaders cannot provide a trustworthy automatic acknowledgement.
+      if (!document.querySelector('.dropzone') && !document.querySelector('.dz-preview')) break;
+      if (wait && poll < 59) await sleep(500);
+    }
+    for (const item of (currentJob.imageItems || []).filter(i => i.state === 'uploading')) {
+      currentJob = (await call('IMAGE_STATE', { url: item.url, state: 'unconfirmed', code: wait && (document.querySelector('.dropzone') || document.querySelector('.dz-preview')) ? 'upload-timeout' : 'upload-unconfirmed', error: 'Няма потвърждение от uploader-а. Провери снимката в сайта; не се повтаря автоматично.' })).transfer;
+    }
+  }
   async function autoUploadImages(images, statusEl) {
     if (uploadBusy) return false;
     uploadBusy = true;
     try {
       await assertOwned();
+      currentJob = (await call('GET_TRANSFER')).transfer;
+      await reconcileImages();
       const input = findFileInput();
       if (!input) throw Error('Отиди на стъпката за добавяне на снимки.');
       if (input.files?.length) throw Error('Вече има избрани снимки. Провери ги и ги премахни ръчно преди повторен опит.');
-      const availableCount = images.length;
-      images = images.slice(0, 17); // mobile.bg limit shown on the upload form.
+      const availableCount = currentJob.data.images.length;
+      const items = (currentJob.imageItems || []).filter(item => ['pending','failed','fetching','fetched'].includes(item.state));
+      if (!items.length) throw Error('Няма снимки за безопасен повторен опит. Предадените снимки чакат потвърждение или вече са качени.');
       const dt = new DataTransfer();
+      const ready = [];
       let failures = 0;
-      for (let i = 0; i < images.length; i++) {
+      for (const item of items) {
         await assertOwned();
-        statusEl.textContent = `Обработвам снимка ${i + 1}/${images.length}...`;
-        try { dt.items.add(await urlToFile(images[i], `car_${String(i + 1).padStart(2, '0')}.jpg`)); }
-        catch (e) { failures++; console.warn('[AI] Image:', e.message); }
+        statusEl.textContent = `Обработвам снимка ${item.index + 1}/${currentJob.imageItems.length}...`;
+        try {
+          if (item.state === 'failed') {
+            const retried = await call('IMAGE_RETRY', { url: item.url });
+            item.filename = retried.transfer.imageItems.find(i => i.url === item.url).filename;
+          }
+          const file = await urlToFile(item.url, item.filename);
+          await call('IMAGE_STATE', { url: item.url, state: 'fetched' });
+          dt.items.add(file); ready.push(item);
+        } catch (e) {
+          failures++;
+          await call('IMAGE_STATE', { url: item.url, state: 'failed', code: 'fetch-failed', error: e.message }).catch(() => {});
+        }
       }
       await assertOwned();
-      if (!dt.files.length) throw Error('Снимките не се изтеглиха. Опитай отново или ги добави ръчно.');
+      if (!ready.length) throw Error('Снимките не се изтеглиха. Виж грешките в Прехвърляния и опитай отново.');
+      // Persist BEFORE touching the page. A crash here is uncertain, never retried blindly.
+      for (const item of ready) await call('IMAGE_STATE', { url: item.url, state: 'uploading' });
+      await assertOwned();
       input.files = dt.files;
       input.dispatchEvent(new Event('change', { bubbles: true }));
       input.dispatchEvent(new Event('input', { bubbles: true }));
-      currentJob = (await call('IMAGES_ASSIGNED', { assigned: dt.files.length, failures })).transfer;
-      statusEl.textContent = `Предадени ${dt.files.length}/${images.length} снимки на формата${failures ? ` (${failures} неуспешни)` : ''}. Провери качването в mobile.bg.${availableCount > 17 ? ' Използвани са първите 17 снимки — лимитът на формата.' : ''}`;
+      currentJob = (await call('IMAGES_ASSIGNED', { assigned: ready.length, failures })).transfer;
+      await reconcileImages(true);
+      const result = currentJob.imageResult;
+      statusEl.textContent = `Предадени ${ready.length}/${currentJob.imageItems.length} снимки. Потвърдени: ${result?.uploaded || 0}; неуспешни: ${result?.failed || 0}; непотвърдени: ${result?.unconfirmed || 0}. Провери качването в mobile.bg.${availableCount > 17 ? ' Използвани са първите 17 снимки — лимитът на формата.' : ''}`;
       return true;
     } catch (e) {
       statusEl.textContent = e.message;
@@ -517,6 +561,7 @@
       currentJob = claimed.transfer;
       await runPhase2(currentJob.data, currentJob.settings, currentJob.n);
     } else if (['images', 'imagesAssigned'].includes(currentJob.phase)) {
+      await reconcileImages();
       for (let i = 0; i < 14 && !findFileInput(); i++) await sleep(300);
       if (!findFileInput()) return;
       showStep2Panel(currentJob.data.images);
@@ -584,12 +629,12 @@
       const ok = await autoUploadImages(images, {
         set textContent(v) { if (statusEl) statusEl.textContent = v; }
       });
-      if (ok) {
+      if (ok && currentJob.imageResult?.outcome === 'complete') {
         this.style.background = 'linear-gradient(135deg,#1d4ed8,#4f46e5)';
         this.textContent = `Предадени на формата — провери снимките.`;
       } else {
         this.disabled = false;
-        this.textContent = `🔄 Опитай отново (${images.length} снимки)`;
+        this.textContent = '🔄 Провери / повтори неуспешните снимки';
       }
     });
 
